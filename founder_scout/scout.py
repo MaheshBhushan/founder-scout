@@ -38,7 +38,7 @@ LOW_VALUE_DOMAINS = ("vcbacked.co", "connectsafely.ai", "rocketreach.co", "zoomi
 # Directory pages that the model sometimes reports as the company's own website.
 AGGREGATOR_DOMAINS = ("producthunt.com", "indiehackers.com", "ycombinator.com", "wellfound.com", "crunchbase.com", "github.com", "medium.com", "substack.com")
 
-PLACEHOLDER_NAME = re.compile(r"\b(not|unknown|mentioned|n/a|none|founder|team|anonymous)\b", re.I)
+PLACEHOLDER_NAME = re.compile(r"\b(not|unknown|mentioned|n/a|none|founder|team|anonymous)\b|\b(john|jane) doe\b|\b(max|erika) mustermann\b|lorem ipsum", re.I)
 AGGREGATOR_NAMES = {"indiehackers", "producthunt", "ycombinator", "wellfound", "angellist", "crunchbase", "github", "medium", "substack"}
 
 SECTORS = ["AI", "fintech", "climate tech", "healthtech", "developer tools", "SaaS", "robotics", "edtech", "biotech", "e-commerce", "cybersecurity", "mobility"]
