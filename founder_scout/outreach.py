@@ -33,6 +33,13 @@ GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland"
 # Shared inboxes that never belong to a job or collaboration enquiry.
 ROLE_INBOXES = {"sales", "support", "press", "media", "jobs", "careers", "karriere", "bewerbung", "hr", "privacy", "datenschutz", "billing", "legal", "abuse", "security"}
 
+# Appended by code so every email carries the same links. The tracker renders
+# [text](url) as a hyperlink in the HTML part and as "text: url" in plain text.
+SIGNATURE = (
+    "Mahesh Koduri\n+49 1551 0823544\n"
+    "[Portfolio](https://mahesh.lol/) | [LinkedIn](https://linkedin.com/in/maheshkoduri/) | [GitHub](https://github.com/MaheshBhushan)"
+)
+
 TRACKS = {
     "working_student": (
         "Track: WORKING STUDENT (Germany). Mahesh is enrolled in a German master's programme and can work as a "
@@ -71,8 +78,8 @@ Project fit:
 
 Hard rules:
 - Every fact about Mahesh comes from the profile or catalog; every fact about the recipient comes from the page text supplied. Never invent metrics, customers or news.
-- Body 80 to 150 words, plain text, paragraphs separated by a blank line, ending with the one-line opt-out and the signature (name, mobile, LinkedIn from the profile; add https://mahesh.lol/ only if it helps).
-- No links besides LinkedIn and the portfolio. No attachments.
+- Body 70 to 140 words, plain text, paragraphs separated by a blank line, ending with the one-line opt-out. Do NOT write a closing name, phone number, signature or any links: a fixed signature with Portfolio, LinkedIn and GitHub links is appended automatically. This overrides the skill's closing rule.
+- No links or URLs in the body. No attachments.
 - Set skip=true (with skip_reason) if the page gives you nothing specific to say about why this person, or the person is not a founder or executive.
 - why_them: one sentence naming the specific thing from their page the email refers to.
 - purpose: one internal line for the dashboard, e.g. "Working-student enquiry; fits vektordb (vector search)".
@@ -244,8 +251,12 @@ class Outreacher:
         d = await self.draft(f, text, track)
         if d["skip"]:
             return Result(f, track, "skipped", d["skip_reason"]), None
-        words = len(d["body"].split())
-        if not 60 <= words <= 190:
+        body = d["body"].strip()
+        # Drop any sign-off the model wrote anyway, then append the fixed signature.
+        body = re.split(r"\n\s*(?:Best|Kind regards|Regards|Cheers|Thanks|Viele Grüße|Beste Grüße|Mit freundlichen Grüßen)?,?\s*\n?\s*Mahesh Koduri\b", body)[0].rstrip()
+        d["body"] = f"{body}\n\n{SIGNATURE}"
+        words = len(body.split())
+        if not 50 <= words <= 170:
             return Result(f, track, "skipped", f"draft body was {words} words"), None
         payload = {
             "to_email": f.email.lower(),
