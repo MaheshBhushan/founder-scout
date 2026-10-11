@@ -141,8 +141,9 @@ class FounderBot(discord.Client):
         try:
             channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
             found = await self.scout_and_post(channel, None, None, None)
-            if self.outreach_auto and any(f.email for f in found):
-                await self.outreach_and_post(channel, [f for f in found if f.email])
+            # Work through every founder not yet emailed, so a restart never strands a run's founders.
+            if self.outreach_auto and self.outreach.room() and self.outreach.pending(1):
+                await self.outreach_and_post(channel)
         except discord.Forbidden:
             log.warning("no access to channel %s; is the bot invited to that server?", self.channel_id)
         except Exception:
