@@ -29,6 +29,9 @@ MODEL = "claude-opus-5-5"
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
 
+# Shared inboxes that never belong to a job or collaboration enquiry.
+ROLE_INBOXES = {"sales", "support", "press", "media", "jobs", "careers", "karriere", "bewerbung", "hr", "privacy", "datenschutz", "billing", "legal", "abuse", "security"}
+
 TRACKS = {
     "working_student": (
         "Track: WORKING STUDENT (Germany). Mahesh is enrolled in a German master's programme and can work as a "
@@ -274,7 +277,24 @@ class Outreacher:
         body = r.json()
         return body["outreach"], body.get("url", "")
 
+    def company_contacted(self, f: Founder) -> bool:
+        """One email per company: match on company name or on the address's domain."""
+        email_domain = f.email.split("@")[-1].lower()
+        row = self.store.db.execute(
+            "SELECT 1 FROM outreach o JOIN founders x ON x.id=o.founder_id WHERE o.decision IN ('queued','already_contacted') AND x.id != ? "
+            "AND ((x.company != '' AND lower(x.company)=lower(?)) OR lower(substr(x.email, instr(x.email,'@')+1))=?) LIMIT 1",
+            (f.id or -1, f.company or "", email_domain),
+        ).fetchone()
+        return row is not None
+
     async def process(self, f: Founder, send: bool = True, dry_run: bool = False) -> Result:
+        local = f.email.split("@")[0].lower()
+        if local in ROLE_INBOXES or self.company_contacted(f):
+            result = Result(f, track_for(f), "skipped", "role inbox" if local in ROLE_INBOXES else "company already contacted")
+            if not dry_run:
+                self.record(result)
+            self.log(f"outreach {f.name} <{f.email}>: skipped {result.reason}")
+            return result
         try:
             result, payload = await self.prepare(f, send)
             if payload and not dry_run:
