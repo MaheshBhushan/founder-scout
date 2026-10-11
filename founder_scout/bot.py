@@ -40,7 +40,7 @@ def embed_for(f: Founder) -> discord.Embed:
 
 
 DECISION_LABEL = {
-    "queued": ("sent", 0x2ECC71), "preview": ("preview, not sent", 0x3498DB), "draft_requested": ("saved as draft", 0xF1C40F),
+    "queued": ("scheduled", 0x2ECC71), "preview": ("preview, not sent", 0x3498DB), "draft_requested": ("saved as draft", 0xF1C40F),
     "missing_evidence": ("draft: address not verified", 0xF1C40F), "auto_send_off": ("draft: auto-send off", 0xF1C40F),
     "already_contacted": ("already contacted", 0x95A5A6), "skipped": ("skipped", 0x95A5A6), "error": ("error", 0xE74C3C),
 }
@@ -52,6 +52,10 @@ def outreach_embed(r: Result, full: bool = False) -> discord.Embed:
     track = "Working student" if r.track == "working_student" else "Remote"
     e = discord.Embed(title=f"✉ {f.name} — {f.company or f.role}"[:256], url=r.url or None, color=color,
                       description=(r.subject and f"**{r.subject}**") or None)
+    if r.send_at and r.tz:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        label += f" · {datetime.fromisoformat(r.send_at).astimezone(ZoneInfo(r.tz)):%a %d %b %H:%M} ({r.tz.split('/')[-1].replace('_', ' ')})"
     e.add_field(name="Status", value=label, inline=True)
     e.add_field(name="Track", value=track, inline=True)
     e.add_field(name="Fit", value=(", ".join(r.projects) if r.projects else "curiosity fallback") if r.fit else "—", inline=True)
@@ -128,8 +132,8 @@ class FounderBot(discord.Client):
                 results = await self.outreach.run(limit)
             else:
                 ids = {f.id for f in founders}
-                todo = [f for f in self.outreach.pending(500) if f.id in ids][: self.outreach.room()]
-                results = [await self.outreach.process(f) for f in todo]
+                todo = [f for f in self.outreach.pending(500) if f.id in ids]
+                results = [r for r in [await self.outreach.process(f) for f in todo] if r.decision != "deferred"]
         for i in range(0, len(results), 10):
             await channel.send(embeds=[outreach_embed(r) for r in results[i:i + 10]])
         return results
@@ -142,7 +146,7 @@ class FounderBot(discord.Client):
             channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
             found = await self.scout_and_post(channel, None, None, None)
             # Work through every founder not yet emailed, so a restart never strands a run's founders.
-            if self.outreach_auto and self.outreach.room() and self.outreach.pending(1):
+            if self.outreach_auto and self.outreach.pending(1):
                 await self.outreach_and_post(channel)
         except discord.Forbidden:
             log.warning("no access to channel %s; is the bot invited to that server?", self.channel_id)
@@ -199,7 +203,7 @@ class FounderBot(discord.Client):
             auto = f"every {self.interval} min" if self.auto_enabled and self.interval else "off"
             await inter.response.send_message(
                 f"Founders: **{s['founders']}** · with email: **{s['with_email']}** (personal: {s['personal_email']}) · pages scraped: {s['pages_scraped']} · auto-scout: {auto}\n"
-                f"Outreach: {self.outreach.sent_last_24h()}/{self.outreach.daily_limit} sent in 24 h · auto-outreach: {'on' if self.outreach_auto else 'off'}"
+                f"Outreach: {self.outreach.scheduled_today()}/{self.outreach.daily_limit} booked today (UTC), sent in recipients' 08:00-11:00 weekday mornings · auto-outreach: {'on' if self.outreach_auto else 'off'}"
             )
 
         @tree.command(name="outreach_preview", description="Draft the outreach email for one founder (#id from the card footer); sends nothing")
@@ -228,13 +232,13 @@ class FounderBot(discord.Client):
             await inter.response.defer(thinking=True)
             results = await self.outreach_and_post(inter.channel, None, count)
             queued = sum(r.decision == "queued" for r in results)
-            await inter.followup.send(f"Outreach: {queued} queued, {len(results) - queued} skipped or drafted. {self.outreach.room()} left in today's limit of {self.outreach.daily_limit}.")
+            await inter.followup.send(f"Outreach: {queued} queued, {len(results) - queued} skipped or drafted. limit {self.outreach.daily_limit} per day, booked into recipients' weekday mornings.")
 
         @tree.command(name="outreach_auto", description="Email new founders automatically after each scouting run")
         async def outreach_auto(inter: discord.Interaction, enabled: bool):
             self.outreach_auto = enabled
             self.store.set("outreach_auto", "true" if enabled else "false")
-            await inter.response.send_message(f"Automatic outreach {'on' if enabled else 'off'} (limit {self.outreach.daily_limit} per 24 h).")
+            await inter.response.send_message(f"Automatic outreach {'on' if enabled else 'off'} (limit {self.outreach.daily_limit} per day, recipients' 08:00-11:00 weekday mornings).")
 
         @tree.command(name="autoscout", description="Turn automatic scouting on or off")
         async def autoscout(inter: discord.Interaction, enabled: bool):

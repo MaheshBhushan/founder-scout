@@ -40,7 +40,8 @@ After each automatic run, the bot emails new founders who have a verified public
 - **Track:** founders in Germany get a working-student enquiry; everyone else a remote-role enquiry.
 - **Fit:** the draft cites one or two catalog projects that overlap with what the company builds. When none fit honestly, it falls back to a curiosity-led email about learning a field from first principles.
 - **Checks:** before drafting, the bot re-fetches the page the address came from and skips the founder if the address is gone. The tracker refuses to auto-send without that page excerpt and never emails an address twice.
-- **Limits:** `OUTREACH_DAILY_LIMIT` (default 8) per 24 hours, inside the tracker's shared cap of 15, and at most one email per `OUTREACH_SPACING_SECONDS` (default 60).
+- **Schedule:** each email is booked into the recipient's weekday morning, 08:00 to 11:00 in their time zone (worked out from their location, else their domain, else Berlin), in 5-minute slots, up to 3 days ahead. The tailor tracker sends it when the slot arrives, at least 4 minutes after the previous scheduled email.
+- **Limits:** `OUTREACH_DAILY_LIMIT` (default 30) emails per day, inside the tracker's shared cap of 40.
 
 | Command | Effect |
 |---|---|

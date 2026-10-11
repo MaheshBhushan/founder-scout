@@ -9,7 +9,6 @@ Mahesh's habit of learning a field from first principles.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -17,6 +16,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import anthropic
 import httpx
@@ -29,6 +29,48 @@ TRACKER_CONFIG = Path.home() / ".config" / "tailor-tracker"
 MODEL = "claude-opus-5-5"
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
+
+# Time zone per place, matched as a substring of the founder's location (first match wins),
+# then by the address or website country domain. Unknown places default to Berlin.
+PLACE_TZ = [
+    (("germany", "deutschland", "berlin", "munich", "münchen", "hamburg", "frankfurt", "cologne", "köln", "stuttgart",
+      "düsseldorf", "leipzig", "karlsruhe", "dresden", "aachen", "nuremberg", "nürnberg"), "Europe/Berlin"),
+    (("london", "united kingdom", " uk", "england", "scotland"), "Europe/London"),
+    (("dublin", "ireland"), "Europe/Dublin"), (("lisbon", "portugal"), "Europe/Lisbon"),
+    (("paris", "france"), "Europe/Paris"), (("amsterdam", "netherlands"), "Europe/Amsterdam"),
+    (("brussels", "belgium"), "Europe/Brussels"), (("zurich", "zürich", "switzerland"), "Europe/Zurich"),
+    (("vienna", "wien", "austria"), "Europe/Vienna"), (("madrid", "barcelona", "spain"), "Europe/Madrid"),
+    (("milan", "italy"), "Europe/Rome"), (("copenhagen", "denmark"), "Europe/Copenhagen"),
+    (("stockholm", "sweden"), "Europe/Stockholm"), (("oslo", "norway"), "Europe/Oslo"),
+    (("helsinki", "finland"), "Europe/Helsinki"), (("tallinn", "estonia"), "Europe/Tallinn"),
+    (("warsaw", "poland"), "Europe/Warsaw"), (("prague", "czech"), "Europe/Prague"),
+    (("san francisco", "bay area", "palo alto", "los angeles", "seattle", "california"), "America/Los_Angeles"),
+    (("new york", "boston", "toronto", "miami"), "America/New_York"), (("austin", "texas", "chicago"), "America/Chicago"),
+    (("mexico",), "America/Mexico_City"), (("são paulo", "sao paulo", "brazil"), "America/Sao_Paulo"),
+    (("bangalore", "bengaluru", "india", "mumbai", "delhi", "hyderabad"), "Asia/Kolkata"),
+    (("singapore",), "Asia/Singapore"), (("tel aviv", "israel"), "Asia/Jerusalem"), (("dubai", "uae"), "Asia/Dubai"),
+    (("lagos", "nigeria"), "Africa/Lagos"), (("nairobi", "kenya"), "Africa/Nairobi"),
+    (("cape town", "south africa"), "Africa/Johannesburg"), (("sydney", "australia"), "Australia/Sydney"),
+    (("tokyo", "japan"), "Asia/Tokyo"), (("seoul", "korea"), "Asia/Seoul"), (("jakarta", "indonesia"), "Asia/Jakarta"),
+]
+TLD_TZ = {"de": "Europe/Berlin", "at": "Europe/Vienna", "ch": "Europe/Zurich", "uk": "Europe/London", "fr": "Europe/Paris",
+          "nl": "Europe/Amsterdam", "es": "Europe/Madrid", "it": "Europe/Rome", "se": "Europe/Stockholm", "in": "Asia/Kolkata",
+          "sg": "Asia/Singapore", "il": "Asia/Jerusalem", "jp": "Asia/Tokyo", "br": "America/Sao_Paulo", "ca": "America/Toronto"}
+# Send window in the recipient's local time, Monday to Friday; slots every SLOT_MINUTES.
+MORNING_START, MORNING_END, SLOT_MINUTES, HORIZON_DAYS = (8, 0), (11, 0), 5, 3
+
+
+def tz_for(f: Founder) -> str:
+    loc = f" {(f.location or '').lower()}"
+    for places, tz in PLACE_TZ:
+        if any(p in loc for p in places):
+            return tz
+    for host in (f.email.split("@")[-1], domain(f.company_website or "")):
+        tld = host.rsplit(".", 1)[-1] if host else ""
+        if tld in TLD_TZ:
+            return TLD_TZ[tld]
+    return "Europe/Berlin"
+
 
 # Shared inboxes that never belong to a job or collaboration enquiry.
 ROLE_INBOXES = {"sales", "support", "press", "media", "jobs", "careers", "karriere", "bewerbung", "hr", "privacy", "datenschutz", "billing", "legal", "abuse", "security"}
@@ -153,6 +195,8 @@ class Result:
     fit: str = ""
     projects: list[str] | None = None
     url: str = ""
+    send_at: str = ""  # UTC ISO time the tracker sends it
+    tz: str = ""
 
 
 class Outreacher:
@@ -160,8 +204,7 @@ class Outreacher:
         self.store = store
         self.scout = scout
         self.log = log
-        self.daily_limit = int(os.environ.get("OUTREACH_DAILY_LIMIT", "8"))
-        self.spacing = int(os.environ.get("OUTREACH_SPACING_SECONDS", "60"))
+        self.daily_limit = int(os.environ.get("OUTREACH_DAILY_LIMIT", "30"))
         self.claude = anthropic.AsyncAnthropic(api_key=anthropic_key())
         self.tracker_url = tracker_setting("TAILOR_TRACKER_URL", "url")
         self.tracker_token = tracker_setting("TAILOR_TRACKER_TOKEN", "token")
@@ -169,6 +212,8 @@ class Outreacher:
             "CREATE TABLE IF NOT EXISTS outreach (founder_id INTEGER PRIMARY KEY, track TEXT, decision TEXT, reason TEXT, "
             "fit TEXT, projects TEXT, subject TEXT, body TEXT, url TEXT, at TEXT)"
         )
+        if "send_at" not in {r[1] for r in store.db.execute("PRAGMA table_info(outreach)")}:
+            store.db.execute("ALTER TABLE outreach ADD COLUMN send_at TEXT")
         store.db.commit()
 
     def _system(self) -> str:
@@ -182,12 +227,40 @@ class Outreacher:
 
     # ---------- selection ----------
 
-    def sent_last_24h(self) -> int:
-        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        return self.store.db.execute("SELECT count(*) FROM outreach WHERE decision='queued' AND at>=?", (since,)).fetchone()[0]
+    def booked(self) -> list[datetime]:
+        rows = self.store.db.execute("SELECT send_at FROM outreach WHERE decision='queued' AND send_at >= ?",
+                                     ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),))
+        return [datetime.fromisoformat(r[0]) for r in rows if r[0]]
+
+    def scheduled_today(self) -> int:
+        today = datetime.now(timezone.utc).date()
+        return sum(1 for t in self.booked() if t.date() == today)
+
+    def next_slot(self, tz: str, taken: list[datetime] | None = None) -> datetime | None:
+        """Earliest free weekday-morning slot in the recipient's zone within HORIZON_DAYS, at most daily_limit per UTC day."""
+        zone, now = ZoneInfo(tz), datetime.now(timezone.utc)
+        taken = sorted(self.booked() if taken is None else taken)
+        per_day: dict = {}
+        for t in taken:
+            per_day[t.date()] = per_day.get(t.date(), 0) + 1
+        gap = timedelta(minutes=SLOT_MINUTES)
+        local_today = now.astimezone(zone).date()
+        for d in range(HORIZON_DAYS + 1):
+            day = local_today + timedelta(days=d)
+            if day.weekday() >= 5:
+                continue
+            t = datetime(day.year, day.month, day.day, *MORNING_START, tzinfo=zone)
+            end = datetime(day.year, day.month, day.day, *MORNING_END, tzinfo=zone)
+            while t < end:
+                u = t.astimezone(timezone.utc)
+                if u > now + timedelta(minutes=2) and per_day.get(u.date(), 0) < self.daily_limit and all(abs(u - b) >= gap for b in taken):
+                    return u
+                t += gap
+        return None
 
     def room(self) -> int:
-        return max(0, self.daily_limit - self.sent_last_24h())
+        """Founders that could still be booked: free slots left today (UTC), as a rough count for the UI."""
+        return max(0, self.daily_limit - self.scheduled_today())
 
     def pending(self, limit: int) -> list[Founder]:
         rows = self.store.db.execute(
@@ -204,9 +277,9 @@ class Outreacher:
 
     def record(self, r: Result) -> None:
         self.store.db.execute(
-            "INSERT OR REPLACE INTO outreach VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO outreach (founder_id,track,decision,reason,fit,projects,subject,body,url,at,send_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (r.founder.id, r.track, r.decision, r.reason, r.fit, json.dumps(r.projects or []), r.subject, r.body, r.url,
-             datetime.now(timezone.utc).isoformat(timespec="seconds")),
+             datetime.now(timezone.utc).isoformat(timespec="seconds"), r.send_at or None),
         )
         self.store.db.commit()
 
@@ -273,19 +346,7 @@ class Outreacher:
         }
         return Result(f, track, "preview", d["why_them"], d["subject"], d["body"], d["fit"], d["projects"]), payload
 
-    async def wait_for_slot(self) -> None:
-        """Keep at least `spacing` seconds between sends, measured from the last queued email in the database."""
-        last = self.store.db.execute("SELECT max(at) FROM outreach WHERE decision='queued'").fetchone()[0]
-        if not last:
-            return
-        wait = self.spacing - (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
-        if wait > 0:
-            self.log(f"outreach: waiting {wait:.0f}s to keep one email per {self.spacing}s")
-            await asyncio.sleep(wait)
-
     async def post(self, payload: dict) -> tuple[str, str]:
-        if payload.get("send", True):
-            await self.wait_for_slot()
         r = await self.scout.http.post(
             f"{self.tracker_url}/api/outreach",
             json=payload,
@@ -320,21 +381,32 @@ class Outreacher:
                 self.record(result)
             self.log(f"outreach {f.name} <{f.email}>: skipped {result.reason}")
             return result
+        tz = tz_for(f)
+        slot = self.next_slot(tz)
+        if slot is None:
+            # Every morning slot in the horizon is booked; stay pending for a later run.
+            return Result(f, track_for(f), "deferred", f"no free morning slot in the next {HORIZON_DAYS} days", tz=tz)
         try:
             result, payload = await self.prepare(f, send)
+            result.tz = tz
+            if payload:
+                payload["send_at"] = result.send_at = slot.isoformat(timespec="seconds")
             if payload and not dry_run:
                 result.decision, result.url = await self.post(payload)
         except (httpx.HTTPError, anthropic.APIError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as e:
             result = Result(f, track_for(f), "error", str(e)[:300])
         if not dry_run:
             self.record(result)
-        self.log(f"outreach {f.name} <{f.email}> [{result.track}/{result.fit or '-'}]: {result.decision} {result.reason}")
+        when = f" at {datetime.fromisoformat(result.send_at).astimezone(ZoneInfo(tz)):%a %H:%M} {tz}" if result.send_at else ""
+        self.log(f"outreach {f.name} <{f.email}> [{result.track}/{result.fit or '-'}]: {result.decision}{when} {result.reason}")
         return result
 
     async def run(self, limit: int | None = None) -> list[Result]:
-        """Process pending founders within the daily limit."""
-        n = min(self.room(), limit if limit is not None else self.daily_limit)
+        """Book pending founders into recipients' morning slots until the horizon is full."""
         results = []
-        for f in self.pending(n):
-            results.append(await self.process(f))
+        for f in self.pending(limit if limit is not None else self.daily_limit):
+            r = await self.process(f)
+            if r.decision == "deferred":
+                break
+            results.append(r)
         return results
