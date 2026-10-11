@@ -1,7 +1,7 @@
-"""Outreach stage: draft an email per founder with Claude and queue it in the tailor tracker.
+"""Outreach stage: draft an email per founder with Codex and queue it in the tailor tracker.
 
-The drafting rules are the outreach skill's own files (SKILL.md plus the tailor
-references it points to), read at runtime so the bot and the skill never drift.
+Drafting runs `codex exec` with the $outreach skill, so Codex reads the skill's
+SKILL.md and the tailor references itself and the bot never drifts from them.
 German companies get a working-student pitch; everyone else a remote-role pitch.
 When no project in the catalog fits the company, the email falls back to
 Mahesh's habit of learning a field from first principles.
@@ -9,16 +9,18 @@ Mahesh's habit of learning a field from first principles.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import shutil
+import tempfile
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import anthropic
 import httpx
 
 from .scout import REGION_TIERS, Founder, Scout, Store, domain, page_emails
@@ -26,7 +28,9 @@ from .scout import REGION_TIERS, Founder, Scout, Store, domain, page_emails
 SKILL_DIR = Path.home() / ".codex" / "skills" / "outreach"
 REFERENCES = Path.home() / ".codex" / "skills" / "tailor" / "references"
 TRACKER_CONFIG = Path.home() / ".config" / "tailor-tracker"
-MODEL = "claude-opus-5-5"
+CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or str(Path.home() / ".local" / "bin" / "codex")
+CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "medium")
+CODEX_TIMEOUT = 600
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
 
@@ -110,12 +114,14 @@ DRAFT_SCHEMA = {
     "additionalProperties": False,
 }
 
-TASK = """You draft one outreach email from Mahesh Koduri to a startup founder, following the outreach skill below exactly.
+TASK = """Use the $outreach skill to draft one outreach email from Mahesh Koduri to a startup founder. Read its SKILL.md and the tailor references it names (profile.md, projects.md, style.md) and follow them exactly.
 
-The track (working student or remote) is given at the top of the user message.
+You only draft. Do not run send.py, do not post to the tracker, do not fetch pages or browse: the founder's page text is supplied below and is the only evidence about the recipient. Return the JSON object described by the output schema.
+
+The track (working student or remote) is given at the top of the founder details.
 
 Project fit:
-- Read what the company builds. Pick one or two catalog projects (exact names from the `### name — Language` headings) whose subject matter genuinely overlaps with it, and set fit="project".
+- Read what the company builds. Pick one or two projects from projects.md (exact names from the `### name — Language` headings) whose subject matter genuinely overlaps with it, and set fit="project".
 - If nothing in the catalog overlaps honestly, set fit="fallback" and projects=[]. The fallback email leads with curiosity: Mahesh learns a field by building it from first principles and refining it until it holds up (for example writing a vector database or an LLM inference engine from scratch to understand them), and he wants to learn their domain the same way. Still cite one such project as evidence, but do not pretend it relates to their product.
 
 Hard rules:
@@ -126,17 +132,6 @@ Hard rules:
 - why_them: one sentence naming the specific thing from their page the email refers to.
 - purpose: one internal line for the dashboard, e.g. "Working-student enquiry; fits vektordb (vector search)".
 
-=== OUTREACH SKILL (SKILL.md) ===
-{skill}
-
-=== PROFILE (profile.md) ===
-{profile}
-
-=== PROJECT CATALOG (projects.md) ===
-{projects}
-
-=== STYLE (style.md) ===
-{style}
 """
 
 
@@ -172,18 +167,6 @@ def tracker_setting(env: str, file: str) -> str:
     return value.rstrip("/")
 
 
-def anthropic_key() -> str:
-    """ANTHROPIC_API_KEY from the environment, else read (not copied) from the env file named by ANTHROPIC_ENV_FILE."""
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return os.environ["ANTHROPIC_API_KEY"]
-    path = Path(os.path.expanduser(os.environ.get("ANTHROPIC_ENV_FILE", "~/.hermes/.env")))
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if line.startswith("ANTHROPIC_API_KEY="):
-                return line.split("=", 1)[1].strip().strip("'\"")
-    raise RuntimeError("ANTHROPIC_API_KEY not set and not found in ANTHROPIC_ENV_FILE")
-
-
 @dataclass
 class Result:
     founder: Founder
@@ -205,7 +188,6 @@ class Outreacher:
         self.scout = scout
         self.log = log
         self.daily_limit = int(os.environ.get("OUTREACH_DAILY_LIMIT", "30"))
-        self.claude = anthropic.AsyncAnthropic(api_key=anthropic_key())
         self.tracker_url = tracker_setting("TAILOR_TRACKER_URL", "url")
         self.tracker_token = tracker_setting("TAILOR_TRACKER_TOKEN", "token")
         store.db.execute(
@@ -215,15 +197,6 @@ class Outreacher:
         if "send_at" not in {r[1] for r in store.db.execute("PRAGMA table_info(outreach)")}:
             store.db.execute("ALTER TABLE outreach ADD COLUMN send_at TEXT")
         store.db.commit()
-
-    def _system(self) -> str:
-        catalog = (REFERENCES / "projects.md").read_text()
-        return TASK.format(
-            skill=(SKILL_DIR / "SKILL.md").read_text(),
-            profile=(REFERENCES / "profile.md").read_text(),
-            projects=catalog,
-            style=(REFERENCES / "style.md").read_text(),
-        )
 
     # ---------- selection ----------
 
@@ -286,29 +259,34 @@ class Outreacher:
     # ---------- pipeline ----------
 
     async def draft(self, f: Founder, page_text: str, track: str) -> dict:
-        system = self._system()
         catalog_names = project_names((REFERENCES / "projects.md").read_text())
-        user = (
+        details = (
+            f"{TRACKS[track]}\n\n"
             f"Recipient: {f.name}, {f.role} at {f.company or 'unknown company'}\n"
             f"Location: {f.location or 'unknown'}\nCompany website: {f.company_website or 'unknown'}\n"
             f"Email: {f.email} (listed on {f.email_source})\n"
             f"Company description (from scraping): {f.company_description}\nBio: {f.bio}\n\n"
             f"=== PAGE TEXT from {f.email_source} ===\n{page_text[:12000]}"
         )
-        resp = await self.claude.beta.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            output_config={"effort": "medium", "format": {"type": "json_schema", "schema": DRAFT_SCHEMA}},
-            # The skill and references are identical across founders, so cache them.
-            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
-            messages=[{"role": "user", "content": f"{TRACKS[track]}\n\n{user}"}],
-        )
-        if resp.stop_reason == "refusal":
-            raise RuntimeError("model declined to draft")
-        text = next(b.text for b in resp.content if b.type == "text")
-        d = json.loads(text)
+        prompt = f"{TASK}\n\n=== FOUNDER ===\n{details}"
+        with tempfile.TemporaryDirectory(prefix="founder-scout-") as tmp:
+            schema, out = Path(tmp) / "schema.json", Path(tmp) / "draft.json"
+            schema.write_text(json.dumps(DRAFT_SCHEMA))
+            # Read-only sandbox rooted in the skill, so its relative ../tailor/references paths resolve.
+            proc = await asyncio.create_subprocess_exec(
+                CODEX_BIN, "exec", "-s", "read-only", "--ephemeral", "--skip-git-repo-check",
+                "-C", str(SKILL_DIR), "-c", f'model_reasoning_effort="{CODEX_EFFORT}"',
+                "--output-schema", str(schema), "-o", str(out), "-",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CODEX_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError("codex timed out")
+            if proc.returncode != 0 or not out.exists() or not out.read_text().strip():
+                raise RuntimeError(f"codex exited {proc.returncode}: {err.decode(errors='replace')[-300:]}")
+            d = json.loads(out.read_text())
         d["projects"] = [p for p in d["projects"] if p in catalog_names]
         if d["fit"] == "project" and not d["projects"]:
             d["fit"] = "fallback"
@@ -393,7 +371,7 @@ class Outreacher:
                 payload["send_at"] = result.send_at = slot.isoformat(timespec="seconds")
             if payload and not dry_run:
                 result.decision, result.url = await self.post(payload)
-        except (httpx.HTTPError, anthropic.APIError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as e:
+        except (httpx.HTTPError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as e:
             result = Result(f, track_for(f), "error", str(e)[:300])
         if not dry_run:
             self.record(result)

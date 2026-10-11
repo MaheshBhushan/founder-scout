@@ -35,7 +35,7 @@ The CLI covers the same steps without Discord: `uv run founder-scout run "climat
 
 ## Outreach
 
-After each automatic run, the bot emails new founders who have a verified public address, through the tailor tracker (`/api/outreach`), and posts a card per email. It drafts with Claude Opus 5.5 using the outreach skill's own rule files (`~/.codex/skills/outreach/SKILL.md` and the tailor references), so the bot and the skill share one set of rules.
+After each automatic run, the bot emails new founders who have a verified public address, through the tailor tracker (`/api/outreach`), and posts a card per email. It drafts each email with `codex exec` and the `$outreach` skill (`~/.codex/skills/outreach/SKILL.md` and the tailor references), in a read-only sandbox, so the bot and the skill share one set of rules. Set `CODEX_BIN` if `codex` is not on the service's `PATH`, and `CODEX_EFFORT` to change the reasoning effort (default `medium`).
 
 - **Track:** founders in Germany get a working-student enquiry; everyone else a remote-role enquiry.
 - **Fit:** the draft cites one or two catalog projects that overlap with what the company builds. When none fit honestly, it falls back to a curiosity-led email about learning a field from first principles.
