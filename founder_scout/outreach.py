@@ -9,6 +9,7 @@ Mahesh's habit of learning a field from first principles.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -153,6 +154,7 @@ class Outreacher:
         self.scout = scout
         self.log = log
         self.daily_limit = int(os.environ.get("OUTREACH_DAILY_LIMIT", "8"))
+        self.spacing = int(os.environ.get("OUTREACH_SPACING_SECONDS", "60"))
         self.claude = anthropic.AsyncAnthropic(api_key=anthropic_key())
         self.tracker_url = tracker_setting("TAILOR_TRACKER_URL", "url")
         self.tracker_token = tracker_setting("TAILOR_TRACKER_TOKEN", "token")
@@ -260,7 +262,19 @@ class Outreacher:
         }
         return Result(f, track, "preview", d["why_them"], d["subject"], d["body"], d["fit"], d["projects"]), payload
 
+    async def wait_for_slot(self) -> None:
+        """Keep at least `spacing` seconds between sends, measured from the last queued email in the database."""
+        last = self.store.db.execute("SELECT max(at) FROM outreach WHERE decision='queued'").fetchone()[0]
+        if not last:
+            return
+        wait = self.spacing - (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
+        if wait > 0:
+            self.log(f"outreach: waiting {wait:.0f}s to keep one email per {self.spacing}s")
+            await asyncio.sleep(wait)
+
     async def post(self, payload: dict) -> tuple[str, str]:
+        if payload.get("send", True):
+            await self.wait_for_slot()
         r = await self.scout.http.post(
             f"{self.tracker_url}/api/outreach",
             json=payload,
