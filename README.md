@@ -5,7 +5,7 @@ A Discord bot that finds startup founders worldwide and posts their profiles, in
 ## How it works
 
 1. **Discovery.** Firecrawl search runs queries against YC company pages, Product Hunt, Indie Hackers, Wellfound, and company "about" pages. If `EXA_API_KEY` is set, Exa semantic search adds founders' personal sites, company team pages, and founder blog posts.
-2. **Extraction.** Firecrawl scrapes each page and returns structured founder data (name, role, company, location, LinkedIn, X, bio).
+2. **Extraction.** Firecrawl scrapes each page and returns structured data (name, role, company, location, LinkedIn, X, bio) for founders, department heads (CTO, Head of Engineering, Data, AI, Product, engineering managers), and employees on the team. Two Firecrawl and two Exa queries target team and leadership pages. Department heads and employees are kept only with a personal address, since a shared inbox does not reach them.
 3. **Email verification.** The bot keeps an email only when the address appears literally in the scraped page text, so model-guessed addresses are dropped. When a founder page lists no email, the bot checks the company homepage and `/contact` page. Each email is labelled `personal` (matches the founder's name), `company inbox` (hello@, founders@), or `listed`, and each email links to the page where it was found.
 4. **Storage.** SQLite deduplicates by person, email, and URL, so the bot posts each founder once and scrapes each page once.
 
@@ -38,6 +38,7 @@ The CLI covers the same steps without Discord: `uv run founder-scout run "climat
 After each automatic run, the bot emails new founders who have a verified public address, through the tailor tracker (`/api/outreach`), and posts a card per email. It drafts each email with `codex exec` and the `$outreach` skill (`~/.codex/skills/outreach/SKILL.md` and the tailor references), in a read-only sandbox, so the bot and the skill share one set of rules. Set `CODEX_BIN` if `codex` is not on the service's `PATH`, and `CODEX_EFFORT` to change the reasoning effort (default `medium`).
 
 - **Track:** founders in Germany get a working-student enquiry; everyone else a remote-role enquiry.
+- **Referrals:** department heads and employees get a referral ask. The email asks them to refer Mahesh or point him to the person who hires. It never asks them to hire him directly. These emails use the `founder-scout-<track>-referral` campaign.
 - **Fit:** the draft cites one or two catalog projects that overlap with what the company builds. When none fit honestly, it falls back to a curiosity-led email about learning a field from first principles.
 - **Checks:** before drafting, the bot re-fetches the page the address came from and skips the founder if the address is gone. The tracker refuses to auto-send without that page excerpt and never emails an address twice.
 - **Schedule:** each email is booked into the recipient's weekday morning, 08:00 to 11:00 in their time zone (worked out from their location, else their domain, else Berlin), in 5-minute slots, up to 3 days ahead. The tailor tracker sends it when the slot arrives, at least 4 minutes after the previous scheduled email.
