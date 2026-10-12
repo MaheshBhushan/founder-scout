@@ -61,11 +61,16 @@ FIRECRAWL_TEMPLATES = [
     "site:producthunt.com {topic} maker founder {region}",
     "site:indiehackers.com/post {topic} founder {region} my startup",
     "site:wellfound.com/company {topic} {region}",
+    # Team and leadership pages list department heads and engineers who can refer Mahesh internally.
+    "{topic} startup {region} \"our team\" \"head of engineering\" OR \"VP engineering\" OR \"engineering manager\"",
+    "{topic} company {region} \"meet the team\" engineers data scientists",
 ]
 EXA_TEMPLATES = [
     ("personal site", "personal website of a {topic} startup founder based in {region}"),
     ("company", "early-stage {topic} startup in {region} with founders listed on the team page"),
     (None, "blog post by the founder of a {topic} startup in {region} sharing their contact email"),
+    ("company", "{topic} startup in {region} whose team page lists the head of engineering, data, or AI and its engineers"),
+    ("personal site", "personal website of an engineering manager or senior engineer at a {topic} startup in {region}"),
 ]
 
 PROFILE_SCHEMA = {
@@ -82,6 +87,7 @@ PROFILE_SCHEMA = {
                 "properties": {
                     "name": {"type": "string"},
                     "role": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["founder", "department_head", "employee"]},
                     "email": {"type": "string"},
                     "linkedin": {"type": "string"},
                     "twitter": {"type": "string"},
@@ -94,10 +100,15 @@ PROFILE_SCHEMA = {
     },
 }
 PROFILE_PROMPT = (
-    "Extract the founders or co-founders described on this page and their company. "
-    "Only include people explicitly named as founder, co-founder, or founding CEO/CTO. "
+    "Extract the people described on this page who work at the company, and the company itself. "
+    "Include founders and co-founders (kind=founder); department heads such as CTO, VP or Head of Engineering, "
+    "Data, AI, Product or Research, and engineering managers or team leads (kind=department_head); and "
+    "engineers, data scientists, researchers or product people on the team (kind=employee). "
+    "Skip investors, advisors, board members, and people who do not work there. Copy each role as written. "
     "Copy emails exactly as written on the page; leave email empty if none is shown. Never guess an email."
 )
+KINDS = ("founder", "department_head", "employee")
+FOUNDER_ROLE = re.compile(r"found", re.I)
 
 
 @dataclass
@@ -117,6 +128,7 @@ class Founder:
     bio: str = ""
     source_url: str = ""
     found_via: str = ""
+    kind: str = "founder"  # "founder", "department_head", or "employee"; non-founders get a referral ask
     found_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     id: int | None = None
 
@@ -155,6 +167,10 @@ class Store:
         self.db.row_factory = sqlite3.Row
         cols = ", ".join(f"{f} TEXT" for f in Founder.__dataclass_fields__ if f not in ("id",))
         self.db.execute(f"CREATE TABLE IF NOT EXISTS founders (id INTEGER PRIMARY KEY, key TEXT UNIQUE, {cols})")
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(founders)")}
+        for f in Founder.__dataclass_fields__:
+            if f != "id" and f not in have:  # rows collected before the column existed are founders
+                self.db.execute(f"ALTER TABLE founders ADD COLUMN {f} TEXT DEFAULT 'founder'" if f == "kind" else f"ALTER TABLE founders ADD COLUMN {f} TEXT")
         self.db.execute("CREATE TABLE IF NOT EXISTS seen_urls (url TEXT PRIMARY KEY, at TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.db.commit()
@@ -190,7 +206,7 @@ class Store:
         f.id = cur.lastrowid if cur.rowcount else None
         return bool(cur.rowcount)
 
-    def search(self, text: str = "", limit: int = 10, with_email: bool = False) -> list[Founder]:
+    def search(self, text: str = "", limit: int = 10, with_email: bool = False, kind: str = "") -> list[Founder]:
         sql = "SELECT * FROM founders WHERE 1=1"
         args: list = []
         if text:
@@ -198,6 +214,9 @@ class Store:
             args += [f"%{text}%"] * 5
         if with_email:
             sql += " AND email != ''"
+        if kind:
+            sql += " AND kind = ?"
+            args.append(kind)
         sql += " ORDER BY id DESC LIMIT ?"
         args.append(limit)
         return [self._row(r) for r in self.db.execute(sql, args)]
@@ -211,6 +230,8 @@ class Store:
             "founders": q("SELECT count(*) FROM founders"),
             "with_email": q("SELECT count(*) FROM founders WHERE email != ''"),
             "personal_email": q("SELECT count(*) FROM founders WHERE email_type='personal'"),
+            "department_heads": q("SELECT count(*) FROM founders WHERE kind='department_head'"),
+            "employees": q("SELECT count(*) FROM founders WHERE kind='employee'"),
             "pages_scraped": q("SELECT count(*) FROM seen_urls"),
         }
 
@@ -368,10 +389,18 @@ class Scout:
             name = (p.get("name") or "").strip()
             if not 2 <= len(name.split()) <= 6 or PLACEHOLDER_NAME.search(name):
                 continue
+            role = (p.get("role") or "").strip()
+            kind = p.get("kind") if p.get("kind") in KINDS else "employee"
+            if FOUNDER_ROLE.search(role):
+                kind = "founder"
             email, etype = pick_email(name, p.get("email", ""), emails, site)
+            # A shared inbox reaches whoever reads it, not this employee, so referral contacts need a personal address.
+            if kind != "founder" and etype == "generic":
+                email, etype = "", ""
             founders.append(Founder(
                 name=name,
-                role=(p.get("role") or "Founder").strip(),
+                role=role or ("Founder" if kind == "founder" else ""),
+                kind=kind,
                 company=(info.get("company") or "").strip(),
                 company_website=site,
                 company_description=(info.get("company_description") or "").strip()[:500],
@@ -405,6 +434,8 @@ class Scout:
             for f in founders:
                 if not f.email:
                     f.email, f.email_type = pick_email(f.name, "", emails, site)
+                    if f.kind != "founder" and f.email_type == "generic":
+                        f.email, f.email_type = "", ""
                     f.email_source = url if f.email else ""
             if all(f.email for f in founders):
                 return
@@ -436,5 +467,6 @@ class Scout:
             for f in batch:
                 if self.store.add(f):
                     new.append(f)
-        self.log(f"{len(new)} new founders, {sum(1 for f in new if f.email)} with email")
+        n_ref = sum(1 for f in new if f.kind != "founder")
+        self.log(f"{len(new)} new people ({n_ref} department heads or employees), {sum(1 for f in new if f.email)} with email")
         return new

@@ -97,6 +97,13 @@ TRACKS = {
     ),
 }
 
+# Added for department heads and employees: they cannot hire Mahesh themselves, but they can refer him.
+REFERRAL_ASK = (
+    "Ask: REFERRAL. The recipient is a {kind} ({role}), not a founder. Do not ask them to hire Mahesh. Open with the "
+    "specific work of theirs or their team that the page shows, then ask whether they would be open to referring him "
+    "for a role on the track above, or to pointing him to the person who handles it. Keep the ask small and easy to decline."
+)
+
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -114,11 +121,11 @@ DRAFT_SCHEMA = {
     "additionalProperties": False,
 }
 
-TASK = """Use the $outreach skill to draft one outreach email from Mahesh Koduri to a startup founder. Read its SKILL.md and the tailor references it names (profile.md, projects.md, style.md) and follow them exactly.
+TASK = """Use the $outreach skill to draft one outreach email from Mahesh Koduri to a founder, department head, or employee at a startup. Read its SKILL.md and the tailor references it names (profile.md, projects.md, style.md) and follow them exactly.
 
 You only draft. Do not run send.py, do not post to the tracker, do not fetch pages or browse: the founder's page text is supplied below and is the only evidence about the recipient. Return the JSON object described by the output schema.
 
-The track (working student or remote) is given at the top of the founder details.
+The track (working student or remote) is given at the top of the recipient details. A REFERRAL ask below the track replaces the hiring ask for non-founders.
 
 Project fit:
 - Read what the company builds. Pick one or two projects from projects.md (exact names from the `### name — Language` headings) whose subject matter genuinely overlaps with it, and set fit="project".
@@ -128,7 +135,7 @@ Hard rules:
 - Every fact about Mahesh comes from the profile or catalog; every fact about the recipient comes from the page text supplied. Never invent metrics, customers or news.
 - Body 70 to 140 words, plain text, paragraphs separated by a blank line, ending with the one-line opt-out. Do NOT write a closing name, phone number, signature or any links: a fixed signature with Portfolio, LinkedIn and GitHub links is appended automatically. This overrides the skill's closing rule.
 - No links or URLs in the body. No attachments.
-- Set skip=true (with skip_reason) if the page gives you nothing specific to say about why this person, or the person is not a founder or executive.
+- Set skip=true (with skip_reason) if the page gives you nothing specific to say about why this person, or the person does not work at the company.
 - why_them: one sentence naming the specific thing from their page the email refers to.
 - purpose: one internal line for the dashboard, e.g. "Working-student enquiry; fits vektordb (vector search)".
 
@@ -142,6 +149,12 @@ def track_for(f: Founder) -> str:
     if not loc and f.company_website and domain(f.company_website).endswith(".de"):
         return "working_student"
     return "remote"
+
+
+def ask_for(f: Founder) -> str:
+    if f.kind in ("department_head", "employee"):
+        return "\n" + REFERRAL_ASK.format(kind=f.kind.replace("_", " "), role=f.role or "role not stated")
+    return ""
 
 
 def project_names(catalog: str) -> set[str]:
@@ -261,14 +274,14 @@ class Outreacher:
     async def draft(self, f: Founder, page_text: str, track: str) -> dict:
         catalog_names = project_names((REFERENCES / "projects.md").read_text())
         details = (
-            f"{TRACKS[track]}\n\n"
+            f"{TRACKS[track]}{ask_for(f)}\n\n"
             f"Recipient: {f.name}, {f.role} at {f.company or 'unknown company'}\n"
             f"Location: {f.location or 'unknown'}\nCompany website: {f.company_website or 'unknown'}\n"
             f"Email: {f.email} (listed on {f.email_source})\n"
             f"Company description (from scraping): {f.company_description}\nBio: {f.bio}\n\n"
             f"=== PAGE TEXT from {f.email_source} ===\n{page_text[:12000]}"
         )
-        prompt = f"{TASK}\n\n=== FOUNDER ===\n{details}"
+        prompt = f"{TASK}\n\n=== RECIPIENT ===\n{details}"
         with tempfile.TemporaryDirectory(prefix="founder-scout-") as tmp:
             schema, out = Path(tmp) / "schema.json", Path(tmp) / "draft.json"
             schema.write_text(json.dumps(DRAFT_SCHEMA))
@@ -317,7 +330,7 @@ class Outreacher:
             "purpose": d["purpose"][:500],
             "source_url": f.email_source,
             "source_excerpt": excerpt_for(text, f.email.lower()),
-            "campaign": f"founder-scout-{track}",
+            "campaign": f"founder-scout-{track}" + ("-referral" if f.kind in ("department_head", "employee") else ""),
             "subject": d["subject"][:300],
             "body": d["body"],
             "send": send,

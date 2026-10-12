@@ -35,7 +35,8 @@ def embed_for(f: Founder) -> discord.Embed:
     links = [f"[{label}]({url})" for label, url in (("Website", f.company_website), ("LinkedIn", f.linkedin), ("X", f.twitter), ("Personal", f.personal_website)) if url]
     if links:
         e.add_field(name="Links", value=" · ".join(links), inline=False)
-    e.set_footer(text=f"#{f.id or '?'} · via {f.found_via} · {f.found_at[:10]}")
+    kind = {"department_head": "department head · referral", "employee": "employee · referral"}.get(f.kind, "founder")
+    e.set_footer(text=f"#{f.id or '?'} · {kind} · via {f.found_via} · {f.found_at[:10]}")
     return e
 
 
@@ -50,6 +51,8 @@ def outreach_embed(r: Result, full: bool = False) -> discord.Embed:
     label, color = DECISION_LABEL.get(r.decision, (r.decision, 0x95A5A6))
     f = r.founder
     track = "Working student" if r.track == "working_student" else "Remote"
+    if f.kind in ("department_head", "employee"):
+        track += " · referral"
     e = discord.Embed(title=f"✉ {f.name} — {f.company or f.role}"[:256], url=r.url or None, color=color,
                       description=(r.subject and f"**{r.subject}**") or None)
     if r.send_at and r.tz:
