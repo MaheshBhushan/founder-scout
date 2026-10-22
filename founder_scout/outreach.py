@@ -1,6 +1,6 @@
-"""Outreach stage: draft an email per founder with Codex and queue it in the tailor tracker.
+"""Outreach stage: draft an email per founder with Claude Code and queue it in the tailor tracker.
 
-Drafting runs `codex exec` with the $outreach skill, so Codex reads the skill's
+Drafting runs `claude -p` with the outreach skill, so Claude reads the skill's
 SKILL.md and the tailor references itself and the bot never drifts from them.
 German companies get a working-student pitch; everyone else a remote-role pitch.
 When no project in the catalog fits the company, the email falls back to
@@ -14,8 +14,8 @@ import json
 import os
 import re
 import shutil
-import tempfile
 import sqlite3
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,12 +25,12 @@ import httpx
 
 from .scout import REGION_TIERS, Founder, Scout, Store, domain, page_emails
 
-SKILL_DIR = Path.home() / ".codex" / "skills" / "outreach"
-REFERENCES = Path.home() / ".codex" / "skills" / "tailor" / "references"
+SKILL_DIR = Path.home() / ".claude" / "skills" / "outreach"
+REFERENCES = Path.home() / ".claude" / "skills" / "tailor" / "references"
 TRACKER_CONFIG = Path.home() / ".config" / "tailor-tracker"
-CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or str(Path.home() / ".local" / "bin" / "codex")
-CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "medium")
-CODEX_TIMEOUT = 600
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "medium")
+CLAUDE_TIMEOUT = 600
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
 
@@ -282,24 +282,27 @@ class Outreacher:
             f"=== PAGE TEXT from {f.email_source} ===\n{page_text[:12000]}"
         )
         prompt = f"{TASK}\n\n=== RECIPIENT ===\n{details}"
-        with tempfile.TemporaryDirectory(prefix="founder-scout-") as tmp:
-            schema, out = Path(tmp) / "schema.json", Path(tmp) / "draft.json"
-            schema.write_text(json.dumps(DRAFT_SCHEMA))
-            # Read-only sandbox rooted in the skill, so its relative ../tailor/references paths resolve.
-            proc = await asyncio.create_subprocess_exec(
-                CODEX_BIN, "exec", "-s", "read-only", "--ephemeral", "--skip-git-repo-check",
-                "-C", str(SKILL_DIR), "-c", f'model_reasoning_effort="{CODEX_EFFORT}"',
-                "--output-schema", str(schema), "-o", str(out), "-",
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CODEX_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise RuntimeError("codex timed out")
-            if proc.returncode != 0 or not out.exists() or not out.read_text().strip():
-                raise RuntimeError(f"codex exited {proc.returncode}: {err.decode(errors='replace')[-300:]}")
-            d = json.loads(out.read_text())
+        # Read-only tools, run from the skill dir so its relative ../tailor/references paths resolve.
+        proc = await asyncio.create_subprocess_exec(
+            CLAUDE_BIN, "-p", "--output-format", "json", "--json-schema", json.dumps(DRAFT_SCHEMA),
+            "--tools", "Read,Grep,Glob", "--add-dir", str(REFERENCES), "--effort", CLAUDE_EFFORT,
+            "--no-session-persistence",
+            cwd=str(SKILL_DIR),
+            # Drop any API key so claude uses the claude.ai login instead.
+            env={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"},
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CLAUDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("claude timed out")
+        res = json.loads(out) if out.strip() else {}
+        # Newer CLIs print a list of events; the final one is the result.
+        res = res[-1] if isinstance(res, list) and res else res
+        d = None if proc.returncode or res.get("is_error") else res.get("structured_output")
+        if not d:
+            raise RuntimeError(f"claude exited {proc.returncode}: {res.get('result') or err.decode(errors='replace')[-300:]}")
         d["projects"] = [p for p in d["projects"] if p in catalog_names]
         if d["fit"] == "project" and not d["projects"]:
             d["fit"] = "fallback"
@@ -364,7 +367,16 @@ class Outreacher:
         ).fetchone()
         return row is not None
 
-    async def process(self, f: Founder, send: bool = True, dry_run: bool = False) -> Result:
+    async def process(self, f: Founder, dry_run: bool = False,
+                      confirm: Callable[[Result], Awaitable[bool]] | None = None) -> Result:
+        """Draft one founder's email and hand it to the tracker.
+
+        Emails are LLM-drafted from scraped page text, so nothing is sent without a human
+        reading it first. Without ``confirm`` the tracker stores a draft (``send: false``) for
+        review on its dashboard. With ``confirm``, the drafted email is shown to the caller
+        and queued for sending only when ``confirm`` returns True.
+        """
+        send = confirm is not None
         local = f.email.split("@")[0].lower()
         if local in ROLE_INBOXES or self.company_contacted(f):
             result = Result(f, track_for(f), "skipped", "role inbox" if local in ROLE_INBOXES else "company already contacted")
@@ -380,6 +392,11 @@ class Outreacher:
         try:
             result, payload = await self.prepare(f, send)
             result.tz = tz
+            if payload and confirm is not None and not dry_run and not await confirm(result):
+                # Declined or timed out: nothing is posted or recorded, so the founder stays pending.
+                result.decision, result.reason = "cancelled", "not confirmed by a human"
+                self.log(f"outreach {f.name} <{f.email}>: cancelled before sending")
+                return result
             if payload:
                 payload["send_at"] = result.send_at = slot.isoformat(timespec="seconds")
             if payload and not dry_run:
@@ -393,7 +410,7 @@ class Outreacher:
         return result
 
     async def run(self, limit: int | None = None) -> list[Result]:
-        """Book pending founders into recipients' morning slots until the horizon is full."""
+        """Draft emails for pending founders into the tracker for human review; sends nothing."""
         results = []
         for f in self.pending(limit if limit is not None else self.daily_limit):
             r = await self.process(f)
