@@ -1,0 +1,16 @@
+[Unit]
+Description=Reacher mailbox verification for Founder Scout and Tailor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker run --rm --name founder-scout-reacher --network host --env-file %h/.config/tailor-tracker/reacher.env --env RCH__HTTP_HOST=127.0.0.1 --env RCH__HTTP_PORT=18081 reacherhq/backend@sha256:6f05f02980c9bebe894d3fc7d312bf569a39063ad3b789bd510631884c7a8153
+ExecStop=/usr/bin/docker stop --timeout 15 founder-scout-reacher
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

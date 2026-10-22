@@ -35,7 +35,7 @@ The CLI covers the same steps without Discord: `uv run founder-scout run "climat
 
 ## Outreach
 
-After each automatic run, the bot emails new founders who have a verified public address, through the tailor tracker (`/api/outreach`), and posts a card per email. It drafts each email with `codex exec` and the `$outreach` skill (`~/.codex/skills/outreach/SKILL.md` and the tailor references), in a read-only sandbox, so the bot and the skill share one set of rules. Set `CODEX_BIN` if `codex` is not on the service's `PATH`, and `CODEX_EFFORT` to change the reasoning effort (default `medium`).
+The bot never sends an LLM-drafted email without a human reading it first. Batch and automatic runs only create drafts in the tailor tracker (`/api/outreach` with `send: false`) for review on its dashboard; `/outreach_send` shows the draft and queues it only after you press **Send**. Automatic drafting after each scouting run is off by default (`/outreach_auto enabled:true` turns it on). It drafts each email with `claude -p` and the outreach skill (`~/.claude/skills/outreach/SKILL.md` and the tailor references), with read-only tools, so the bot and the skill share one set of rules. Set `CLAUDE_BIN` if `claude` is not on the service's `PATH`, and `CLAUDE_EFFORT` to change the effort level (default `medium`).
 
 - **Track:** founders in Germany get a working-student enquiry; everyone else a remote-role enquiry.
 - **Referrals:** department heads and employees get a referral ask. The email asks them to refer Mahesh or point him to the person who hires. It never asks them to hire him directly. These emails use the `founder-scout-<track>-referral` campaign.
@@ -47,11 +47,119 @@ After each automatic run, the bot emails new founders who have a verified public
 | Command | Effect |
 |---|---|
 | `/outreach_preview founder_id` | Drafts the email and shows it to you only; sends nothing |
-| `/outreach_send founder_id` | Drafts and sends one email |
-| `/outreach_run [count]` | Emails pending founders now, within the daily limit |
-| `/outreach_auto enabled` | Toggles outreach after automatic runs |
+| `/outreach_send founder_id` | Drafts one email, shows it to you, and queues it only after you press **Send** (10 minute timeout cancels) |
+| `/outreach_run [count]` | Drafts emails for pending founders into the tracker for review; sends nothing |
+| `/outreach_auto enabled` | Toggles drafting after automatic runs (default off; drafts only) |
 
-CLI equivalents: `uv run founder-scout outreach-preview <id>`, `outreach-send <id>`, `outreach-run [n]`. The founder id is the `#n` in each card's footer.
+CLI equivalents: `uv run founder-scout outreach-preview <id>`, `outreach-send <id>` (prints the draft and asks `y/N`; never sends from a non-interactive shell), `outreach-run [n]` (drafts only). The founder id is the `#n` in each card's footer.
+
+### Researched application-contact fallback
+
+When an application posting has no usable personal email, research a relevant named
+employee or hiring contact first, then run the explicit fallback command:
+
+```sh
+# Start contact research early, in parallel with resume/cover-letter generation:
+uv run founder-scout contact-resolve contact.json
+# Only after reviewing the researched identity and outreach draft:
+uv run founder-scout contact-resolve contact.json --queue
+```
+
+This command does not change automated discovery, invoke Claude Code, touch the founder
+database, or send Gmail directly. Without `--queue`, it only contacts Reacher and
+prints JSON; an optional `outreach` produces a tracker-ready immediate-dispatch
+`payload`, not a send. Omit `outreach` for early contact research while application
+documents are being generated. With `--queue`, a unique safe match is posted to
+the tracker for immediate dispatch, not a next-morning slot.
+
+Exact manifest structure (the identity excerpt below was fetched from the linked
+public Apple leadership page; this is a **format example, not an outreach recommendation**).
+Replace the entire researched contact and draft with your own verified, relevant
+recipient. Do not run `--queue` on this example:
+
+```json
+{
+  "contact": {
+    "name": "Anna Schmidt",
+    "domain": "company.example",
+    "source_url": "https://company.example/team",
+    "source_excerpt": "Anna Schmidt leads the engineering team at Example Company.",
+    "company": "Example Company",
+    "role": "Engineering Manager",
+    "location": "Berlin"
+  },
+  "emails": [],
+  "outreach": {
+    "subject": "Engineering enquiry",
+    "body": "I am researching engineering opportunities and would appreciate being pointed to the appropriate hiring contact. If this is not relevant, please let me know and I will not contact you again.",
+    "purpose": "Application-contact enquiry",
+    "campaign": "tailor-contact-fallback"
+  }
+}
+```
+
+The manifest above is illustrative, not real contact evidence. Replace its
+identity and excerpt with information fetched from the employer's live site.
+
+The contact fields may also be at the manifest's top level. `name`, `domain`,
+`source_url`, `source_excerpt`, `company`, and `role` are required; `location` is
+optional. The source must be an official company-domain/subdomain HTTP(S) page
+with genuine public identity/employment evidence. Copy plain verbatim visible page
+text, not Markdown decoration; the excerpt must literally include the full name
+and be at most 1,000 characters. Never invent an excerpt or replace it with the
+guessed address. The tracker independently re-fetches the source and rejects
+unconfirmed identity evidence.
+
+`emails` is an optional list of complete researched personal addresses at the
+company domain, checked first. It is not a claim that an address is published.
+The resolver also guesses `first.last`, `firstlast`, `f.last`, `flast`, `first`,
+`first_last`, and `last.first`, normalizing accents and removing name punctuation.
+Guesses require at least two name parts. Candidates are deduplicated and bounded
+to eight total (researched addresses take precedence); generic inboxes are never
+selected. Even an address actually published in the excerpt must pass Reacher in
+this command.
+
+Set `REACHER_URL` to a trusted deployment of
+[reacherhq/check-if-email-exists](https://github.com/reacherhq/check-if-email-exists),
+such as `http://127.0.0.1:8080` (base URL, not an endpoint). Requests go to
+`POST /v0/check_email` with `{"to_email": "<candidate>"}` and a 30-second timeout per
+candidate. Optional `REACHER_API_KEY` is sent as `x-reacher-secret`. The resolver
+also reads `~/.config/tailor-tracker/reacher-url` and `reacher-key`; nonempty
+environment values override these files. Keep the service key private. `--queue` also
+requires `TAILOR_TRACKER_URL` and `TAILOR_TRACKER_TOKEN`, or the existing
+`~/.config/tailor-tracker/{url,token}` files. The tracker must have its own trusted
+Reacher settings: it rechecks the selected address and never trusts the CLI result.
+
+Every candidate is checked. A match requires the exact returned `input`,
+`is_reachable="safe"`, valid syntax, accepting MX, SMTP connectivity and
+deliverability, and explicitly false catch-all, disabled, full-inbox, disposable,
+and role-account flags. Missing flags, unknown results, timeouts, and service
+errors fail closed.
+A unique safe mailbox is delivery evidence, not proof of who reads it. Current
+identity/employment and role relevance still come from the researched company
+page; no candidate is selected when those facts are unsupported.
+
+| JSON `decision` | Meaning |
+|---|---|
+| `verified` | Exactly one safe match; `selected_address` is set, with `payload` if outreach was supplied |
+| `ambiguous` | Multiple safe mailboxes; ownership is unknown, so no selection or queue |
+| `verification_failed` | No safe candidate, or an unknown/malformed result prevents a confident unique selection |
+| `verification_unavailable` | Reacher is missing, errored, or timed out; no queue, even if another candidate was safe |
+| `validation_error` | Invalid manifest or `--queue` without outreach; CLI exits 2 |
+| `queue_unavailable` / `queue_error` | Tracker configuration/request failure; CLI exits 1 |
+| Tracker decision, e.g. `queued`, `missing_evidence`, `already_contacted` | Returned only after an actual tracker request; `tracker` contains its response |
+
+Each output includes `candidates` with raw Reacher `result`, status, and rejection
+`reasons`. `outreach` is optional unless using `--queue`, and requires `subject`,
+`body`, and `purpose`; `campaign` defaults to `tailor-contact-fallback`.
+A unique match's payload sets `send: true` and omits `send_at`; application-contact
+fallback outreach is dispatched immediately rather than scheduled for morning.
+The tracker still independently verifies identity and mailbox safety and enforces
+deduplication and shared sending caps. Founder campaign morning scheduling is
+unchanged.
+The request goes only to `POST /api/outreach`, with
+`email_verification={"method":"reacher","name":"<researched name>","domain":"<company domain>"}`.
+
 
 ## Automatic runs
 
@@ -66,6 +174,28 @@ systemctl --user status founder-scout
 journalctl --user -u founder-scout -f
 uv run founder-scout pause    # or resume; then: systemctl --user restart founder-scout
 ```
+
+The separately installed `founder-scout-reacher.service` runs the digest-pinned
+Reacher Docker backend on `127.0.0.1:18081`. The existing Cloudflare Tunnel exposes
+only its `/v0/check_email` route at `https://reacher.mahesh.lol`, protected by the
+`x-reacher-secret` header. The service definition is
+`deploy/founder-scout-reacher.service`; its private environment lives at
+`~/.config/tailor-tracker/reacher.env`, and the CLI reads `reacher-url`/`reacher-key`
+from the same directory. Never commit these secret files.
+The container uses host networking but binds the API to loopback only. This
+avoids Docker bridge DNS timeouts observed on this workstation; port 25 must
+remain reachable for SMTP checks.
+
+```sh
+systemctl --user status founder-scout-reacher
+systemctl --user restart founder-scout-reacher
+journalctl --user -u founder-scout-reacher -f
+```
+
+This verification endpoint depends on this machine, Docker, and the tunnel staying
+online. If they stop or verification times out, both the resolver and tracker
+fail closed rather than queueing an unverified address.
+
 
 ## Cost
 
