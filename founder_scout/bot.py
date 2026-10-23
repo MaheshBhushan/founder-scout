@@ -7,6 +7,7 @@ import csv
 import io
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -115,6 +116,18 @@ class ConfirmSend(discord.ui.View):
         self.stop()
 
 
+async def send_embeds(channel: discord.abc.Messageable, embeds: list[discord.Embed]) -> None:
+    """Discord allows 10 embeds and 6000 embed characters per message."""
+    batch: list[discord.Embed] = []
+    for e in embeds:
+        if batch and (len(batch) == 10 or sum(len(b) for b in batch) + len(e) > 6000):
+            await channel.send(embeds=batch)
+            batch = []
+        batch.append(e)
+    if batch:
+        await channel.send(embeds=batch)
+
+
 class FounderBot(discord.Client):
     def __init__(self, settings: Settings, channel_id: int, guild_id: int | None, interval: int):
         super().__init__(intents=discord.Intents.default())
@@ -132,6 +145,7 @@ class FounderBot(discord.Client):
         # Persistent like auto_enabled: after each automatic run, draft emails for new founders
         # and queue them in morning send slots. Off unless someone turns it on.
         self.outreach_auto = self.store.get("outreach_auto", "false") == "true"
+        self.retry_task: asyncio.Task | None = None
         self._register()
 
     async def setup_hook(self) -> None:
@@ -147,6 +161,7 @@ class FounderBot(discord.Client):
             log.warning("bot is in no server yet; invite it with https://discord.com/oauth2/authorize?client_id=%s&scope=bot+applications.commands&permissions=117760", self.user.id)
         for g in self.guilds:
             await self._sync_guild(g)
+        self.schedule_limit_retry()  # a usage limit hit before a restart still gets its retry
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         log.info("joined server %s", guild.name)
@@ -164,8 +179,7 @@ class FounderBot(discord.Client):
         await super().close()
 
     async def post(self, channel: discord.abc.Messageable, founders: list[Founder]) -> None:
-        for i in range(0, len(founders), 10):  # Discord allows 10 embeds per message
-            await channel.send(embeds=[embed_for(f) for f in founders[i:i + 10]])
+        await send_embeds(channel, [embed_for(f) for f in founders])
 
     async def scout_and_post(self, channel: discord.abc.Messageable, topic: str | None, region: str | None, pages: int | None) -> list[Founder]:
         async with self.lock:
@@ -184,9 +198,28 @@ class FounderBot(discord.Client):
                 ids = {f.id for f in founders}
                 todo = [f for f in self.outreach.pending(500) if f.id in ids]
                 results = [r for r in [await self.outreach.process(f) for f in todo] if r.decision != "deferred"]
-        for i in range(0, len(results), 10):
-            await channel.send(embeds=[outreach_embed(r) for r in results[i:i + 10]])
+        await send_embeds(channel, [outreach_embed(r) for r in results])
+        if founders is None:
+            self.schedule_limit_retry()
         return results
+
+    def schedule_limit_retry(self) -> None:
+        """After a Claude usage limit, run the pending backlog again a minute after it resets."""
+        until = self.outreach.paused_until()
+        if not until or not self.outreach_auto or (self.retry_task and not self.retry_task.done()):
+            return
+
+        async def retry() -> None:
+            await asyncio.sleep((until - datetime.now(timezone.utc)).total_seconds() + 60)
+            log.info("claude usage limit reset; retrying pending outreach")
+            try:
+                channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
+                await self.outreach_and_post(channel)
+            except Exception:
+                log.exception("outreach retry after usage limit failed")
+
+        log.info("claude usage limit hit; retrying outreach after %s", until.isoformat())
+        self.retry_task = asyncio.create_task(retry())
 
     @tasks.loop(minutes=60)
     async def auto_loop(self) -> None:
