@@ -7,6 +7,7 @@ import csv
 import io
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -35,14 +36,15 @@ def embed_for(f: Founder) -> discord.Embed:
     links = [f"[{label}]({url})" for label, url in (("Website", f.company_website), ("LinkedIn", f.linkedin), ("X", f.twitter), ("Personal", f.personal_website)) if url]
     if links:
         e.add_field(name="Links", value=" · ".join(links), inline=False)
-    e.set_footer(text=f"#{f.id or '?'} · via {f.found_via} · {f.found_at[:10]}")
+    kind = {"department_head": "department head · referral", "employee": "employee · referral"}.get(f.kind, "founder")
+    e.set_footer(text=f"#{f.id or '?'} · {kind} · via {f.found_via} · {f.found_at[:10]}")
     return e
 
 
 DECISION_LABEL = {
     "queued": ("scheduled", 0x2ECC71), "preview": ("preview, not sent", 0x3498DB), "draft_requested": ("saved as draft", 0xF1C40F),
     "missing_evidence": ("draft: address not verified", 0xF1C40F), "auto_send_off": ("draft: auto-send off", 0xF1C40F),
-    "already_contacted": ("already contacted", 0x95A5A6), "skipped": ("skipped", 0x95A5A6), "error": ("error", 0xE74C3C),
+    "cancelled": ("cancelled, not sent", 0x95A5A6), "already_contacted": ("already contacted", 0x95A5A6), "skipped": ("skipped", 0x95A5A6), "error": ("error", 0xE74C3C),
 }
 
 
@@ -50,6 +52,8 @@ def outreach_embed(r: Result, full: bool = False) -> discord.Embed:
     label, color = DECISION_LABEL.get(r.decision, (r.decision, 0x95A5A6))
     f = r.founder
     track = "Working student" if r.track == "working_student" else "Remote"
+    if f.kind in ("department_head", "employee"):
+        track += " · referral"
     e = discord.Embed(title=f"✉ {f.name} — {f.company or f.role}"[:256], url=r.url or None, color=color,
                       description=(r.subject and f"**{r.subject}**") or None)
     if r.send_at and r.tz:
@@ -67,10 +71,68 @@ def outreach_embed(r: Result, full: bool = False) -> discord.Embed:
     return e
 
 
+def _allowed_user_ids() -> frozenset[int]:
+    raw = os.environ.get("DISCORD_ALLOWED_USER_IDS", "")
+    return frozenset(int(part) for part in raw.replace(",", " ").split() if part.isdigit())
+
+
+class GatedCommandTree(app_commands.CommandTree):
+    """Slash commands send email from the owner's mailbox and export the contact
+    database, so they only run in the configured channel and, when
+    DISCORD_ALLOWED_USER_IDS is set, only for those Discord users."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        client = interaction.client
+        allowed_users = getattr(client, "allowed_user_ids", frozenset())
+        in_channel = interaction.channel_id == getattr(client, "channel_id", None)
+        in_guild = getattr(client, "guild_id", None) in (None, interaction.guild_id)
+        allowed = in_channel and in_guild and (not allowed_users or interaction.user.id in allowed_users)
+        if not allowed:
+            log.warning("refused /%s from user %s in channel %s", interaction.command and interaction.command.name, interaction.user.id, interaction.channel_id)
+            await interaction.response.send_message("This command is not available here.", ephemeral=True)
+        return allowed
+
+
+class ConfirmSend(discord.ui.View):
+    """Send / Cancel buttons under an LLM-drafted email. Only the requesting user can press them."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.approved = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="Send", style=discord.ButtonStyle.danger)
+    async def send(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.approved = True
+        await interaction.response.edit_message(content="Confirmed; queueing.", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancelled; nothing was sent.", view=None)
+        self.stop()
+
+
+async def send_embeds(channel: discord.abc.Messageable, embeds: list[discord.Embed]) -> None:
+    """Discord allows 10 embeds and 6000 embed characters per message."""
+    batch: list[discord.Embed] = []
+    for e in embeds:
+        if batch and (len(batch) == 10 or sum(len(b) for b in batch) + len(e) > 6000):
+            await channel.send(embeds=batch)
+            batch = []
+        batch.append(e)
+    if batch:
+        await channel.send(embeds=batch)
+
+
 class FounderBot(discord.Client):
     def __init__(self, settings: Settings, channel_id: int, guild_id: int | None, interval: int):
         super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
+        self.tree = GatedCommandTree(self)
+        self.allowed_user_ids = _allowed_user_ids()
         self.store = Store(settings.db_path)
         self.scout = Scout(settings, self.store, log=log.info)
         self.channel_id = channel_id
@@ -80,8 +142,10 @@ class FounderBot(discord.Client):
         # Pause state lives in the database so it survives restarts.
         self.auto_enabled = interval > 0 and self.store.get("auto_enabled", "true") == "true"
         self.outreach = Outreacher(self.store, self.scout, log=log.info)
-        # Persistent like auto_enabled: after each automatic run, email new founders.
-        self.outreach_auto = self.store.get("outreach_auto", "true") == "true"
+        # Persistent like auto_enabled: after each automatic run, draft emails for new founders
+        # and queue them in morning send slots. Off unless someone turns it on.
+        self.outreach_auto = self.store.get("outreach_auto", "false") == "true"
+        self.retry_task: asyncio.Task | None = None
         self._register()
 
     async def setup_hook(self) -> None:
@@ -97,6 +161,7 @@ class FounderBot(discord.Client):
             log.warning("bot is in no server yet; invite it with https://discord.com/oauth2/authorize?client_id=%s&scope=bot+applications.commands&permissions=117760", self.user.id)
         for g in self.guilds:
             await self._sync_guild(g)
+        self.schedule_limit_retry()  # a usage limit hit before a restart still gets its retry
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         log.info("joined server %s", guild.name)
@@ -114,8 +179,7 @@ class FounderBot(discord.Client):
         await super().close()
 
     async def post(self, channel: discord.abc.Messageable, founders: list[Founder]) -> None:
-        for i in range(0, len(founders), 10):  # Discord allows 10 embeds per message
-            await channel.send(embeds=[embed_for(f) for f in founders[i:i + 10]])
+        await send_embeds(channel, [embed_for(f) for f in founders])
 
     async def scout_and_post(self, channel: discord.abc.Messageable, topic: str | None, region: str | None, pages: int | None) -> list[Founder]:
         async with self.lock:
@@ -126,7 +190,7 @@ class FounderBot(discord.Client):
         return founders
 
     async def outreach_and_post(self, channel: discord.abc.Messageable, founders: list[Founder] | None = None, limit: int | None = None) -> list[Result]:
-        """Email founders (the given ones, or the pending backlog) within the daily limit and report each result."""
+        """Draft emails for founders (the given ones, or the pending backlog) into the tracker for review."""
         async with self.lock:
             if founders is None:
                 results = await self.outreach.run(limit)
@@ -134,9 +198,28 @@ class FounderBot(discord.Client):
                 ids = {f.id for f in founders}
                 todo = [f for f in self.outreach.pending(500) if f.id in ids]
                 results = [r for r in [await self.outreach.process(f) for f in todo] if r.decision != "deferred"]
-        for i in range(0, len(results), 10):
-            await channel.send(embeds=[outreach_embed(r) for r in results[i:i + 10]])
+        await send_embeds(channel, [outreach_embed(r) for r in results])
+        if founders is None:
+            self.schedule_limit_retry()
         return results
+
+    def schedule_limit_retry(self) -> None:
+        """After a Claude usage limit, run the pending backlog again a minute after it resets."""
+        until = self.outreach.paused_until()
+        if not until or not self.outreach_auto or (self.retry_task and not self.retry_task.done()):
+            return
+
+        async def retry() -> None:
+            await asyncio.sleep((until - datetime.now(timezone.utc)).total_seconds() + 60)
+            log.info("claude usage limit reset; retrying pending outreach")
+            try:
+                channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
+                await self.outreach_and_post(channel)
+            except Exception:
+                log.exception("outreach retry after usage limit failed")
+
+        log.info("claude usage limit hit; retrying outreach after %s", until.isoformat())
+        self.retry_task = asyncio.create_task(retry())
 
     @tasks.loop(minutes=60)
     async def auto_loop(self) -> None:
@@ -216,29 +299,37 @@ class FounderBot(discord.Client):
             r = await self.outreach.process(f, dry_run=True)
             await inter.followup.send(embed=outreach_embed(r, full=True), ephemeral=True)
 
-        @tree.command(name="outreach_send", description="Draft and send the outreach email for one founder (#id)")
+        @tree.command(name="outreach_send", description="Draft the email for one founder (#id) and send it after you confirm")
         async def outreach_send(inter: discord.Interaction, founder_id: int):
             f = self.outreach.founder(founder_id)
             if not f or not f.email:
                 await inter.response.send_message("No founder with that id and a public email.", ephemeral=True)
                 return
             await inter.response.defer(thinking=True)
+
+            async def confirm(draft: Result) -> bool:
+                view = ConfirmSend(inter.user.id)
+                await inter.followup.send("Review this draft. Nothing is sent until you press **Send**.",
+                                          embed=outreach_embed(draft, full=True), view=view, ephemeral=True)
+                await view.wait()
+                return view.approved
+
             async with self.lock:
-                r = await self.outreach.process(f)
+                r = await self.outreach.process(f, confirm=confirm)
             await inter.followup.send(embed=outreach_embed(r, full=True))
 
-        @tree.command(name="outreach_run", description="Email pending founders now, within the daily limit")
+        @tree.command(name="outreach_run", description="Draft emails for pending founders into the tracker for review; sends nothing")
         async def outreach_run(inter: discord.Interaction, count: app_commands.Range[int, 1, 20] = 5):
             await inter.response.defer(thinking=True)
             results = await self.outreach_and_post(inter.channel, None, count)
-            queued = sum(r.decision == "queued" for r in results)
-            await inter.followup.send(f"Outreach: {queued} queued, {len(results) - queued} skipped or drafted. limit {self.outreach.daily_limit} per day, booked into recipients' weekday mornings.")
+            drafted = sum(r.decision not in ("skipped", "error") for r in results)
+            await inter.followup.send(f"Outreach: {drafted} drafted for review in the tracker, {len(results) - drafted} skipped or failed. Nothing was sent.")
 
-        @tree.command(name="outreach_auto", description="Email new founders automatically after each scouting run")
+        @tree.command(name="outreach_auto", description="Draft and schedule emails for new founders after each scouting run")
         async def outreach_auto(inter: discord.Interaction, enabled: bool):
             self.outreach_auto = enabled
             self.store.set("outreach_auto", "true" if enabled else "false")
-            await inter.response.send_message(f"Automatic outreach {'on' if enabled else 'off'} (limit {self.outreach.daily_limit} per day, recipients' 08:00-11:00 weekday mornings).")
+            await inter.response.send_message(f"Automatic outreach drafts {'on' if enabled else 'off'}. Drafts wait in the tracker for review; nothing is sent automatically.")
 
         @tree.command(name="autoscout", description="Turn automatic scouting on or off")
         async def autoscout(inter: discord.Interaction, enabled: bool):

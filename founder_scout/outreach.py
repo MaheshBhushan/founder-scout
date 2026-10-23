@@ -1,6 +1,6 @@
-"""Outreach stage: draft an email per founder with Codex and queue it in the tailor tracker.
+"""Outreach stage: draft an email per founder with Claude Code and queue it in the tailor tracker.
 
-Drafting runs `codex exec` with the $outreach skill, so Codex reads the skill's
+Drafting runs `claude -p` with the outreach skill, so Claude reads the skill's
 SKILL.md and the tailor references itself and the bot never drifts from them.
 German companies get a working-student pitch; everyone else a remote-role pitch.
 When no project in the catalog fits the company, the email falls back to
@@ -14,8 +14,8 @@ import json
 import os
 import re
 import shutil
-import tempfile
 import sqlite3
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,12 +25,13 @@ import httpx
 
 from .scout import REGION_TIERS, Founder, Scout, Store, domain, page_emails
 
-SKILL_DIR = Path.home() / ".codex" / "skills" / "outreach"
-REFERENCES = Path.home() / ".codex" / "skills" / "tailor" / "references"
+SKILL_DIR = Path.home() / ".claude" / "skills" / "outreach"
+REFERENCES = Path.home() / ".claude" / "skills" / "tailor" / "references"
 TRACKER_CONFIG = Path.home() / ".config" / "tailor-tracker"
-CODEX_BIN = os.environ.get("CODEX_BIN") or shutil.which("codex") or str(Path.home() / ".local" / "bin" / "codex")
-CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "medium")
-CODEX_TIMEOUT = 600
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
+CLAUDE_TIMEOUT = 600
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
 
@@ -97,6 +98,13 @@ TRACKS = {
     ),
 }
 
+# Added for department heads and employees: they cannot hire Mahesh themselves, but they can refer him.
+REFERRAL_ASK = (
+    "Ask: REFERRAL. The recipient is a {kind} ({role}), not a founder. Do not ask them to hire Mahesh. Open with the "
+    "specific work of theirs or their team that the page shows, then ask whether they would be open to referring him "
+    "for a role on the track above, or to pointing him to the person who handles it. Keep the ask small and easy to decline."
+)
+
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -114,11 +122,11 @@ DRAFT_SCHEMA = {
     "additionalProperties": False,
 }
 
-TASK = """Use the $outreach skill to draft one outreach email from Mahesh Koduri to a startup founder. Read its SKILL.md and the tailor references it names (profile.md, projects.md, style.md) and follow them exactly.
+TASK = """Use the $outreach skill to draft one outreach email from Mahesh Koduri to a founder, department head, or employee at a startup. Read its SKILL.md and the tailor references it names (profile.md, projects.md, style.md) and follow them exactly.
 
 You only draft. Do not run send.py, do not post to the tracker, do not fetch pages or browse: the founder's page text is supplied below and is the only evidence about the recipient. Return the JSON object described by the output schema.
 
-The track (working student or remote) is given at the top of the founder details.
+The track (working student or remote) is given at the top of the recipient details. A REFERRAL ask below the track replaces the hiring ask for non-founders.
 
 Project fit:
 - Read what the company builds. Pick one or two projects from projects.md (exact names from the `### name — Language` headings) whose subject matter genuinely overlaps with it, and set fit="project".
@@ -128,7 +136,7 @@ Hard rules:
 - Every fact about Mahesh comes from the profile or catalog; every fact about the recipient comes from the page text supplied. Never invent metrics, customers or news.
 - Body 70 to 140 words, plain text, paragraphs separated by a blank line, ending with the one-line opt-out. Do NOT write a closing name, phone number, signature or any links: a fixed signature with Portfolio, LinkedIn and GitHub links is appended automatically. This overrides the skill's closing rule.
 - No links or URLs in the body. No attachments.
-- Set skip=true (with skip_reason) if the page gives you nothing specific to say about why this person, or the person is not a founder or executive.
+- Set skip=true (with skip_reason) if the page gives you nothing specific to say about why this person, or the person does not work at the company.
 - why_them: one sentence naming the specific thing from their page the email refers to.
 - purpose: one internal line for the dashboard, e.g. "Working-student enquiry; fits vektordb (vector search)".
 
@@ -142,6 +150,12 @@ def track_for(f: Founder) -> str:
     if not loc and f.company_website and domain(f.company_website).endswith(".de"):
         return "working_student"
     return "remote"
+
+
+def ask_for(f: Founder) -> str:
+    if f.kind in ("department_head", "employee"):
+        return "\n" + REFERRAL_ASK.format(kind=f.kind.replace("_", " "), role=f.role or "role not stated")
+    return ""
 
 
 def project_names(catalog: str) -> set[str]:
@@ -180,6 +194,37 @@ class Result:
     url: str = ""
     send_at: str = ""  # UTC ISO time the tracker sends it
     tz: str = ""
+
+
+RESET_RE = re.compile(r"resets (?:(\w{3} \d{1,2}),? )?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", re.I)
+
+
+def limit_reset(reason: str, now: datetime | None = None) -> datetime | None:
+    """When a Claude usage limit lifts, from 'session limit · resets 4:10pm (Europe/Berlin)'.
+
+    None when the reason is not a usage limit. An unparseable reset time falls back to one hour.
+    """
+    if "claude" not in reason or "limit" not in reason:
+        return None
+    now = now or datetime.now(timezone.utc)
+    m = RESET_RE.search(reason)
+    if not m:
+        return now + timedelta(hours=1)
+    day, hour, minute, ampm, tz = m.groups()
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        return now + timedelta(hours=1)
+    hour = int(hour) % 12 + (12 if ampm.lower() == "pm" else 0)
+    local = now.astimezone(zone)
+    if day:
+        d = datetime.strptime(f"{day} {local.year}", "%b %d %Y").date()
+    else:
+        d = local.date()
+    t = datetime(d.year, d.month, d.day, hour, int(minute or 0), tzinfo=zone)
+    if t <= local:
+        t += timedelta(days=1)
+    return t.astimezone(timezone.utc)
 
 
 class Outreacher:
@@ -231,6 +276,12 @@ class Outreacher:
                 t += gap
         return None
 
+    def paused_until(self) -> datetime | None:
+        """The time a hit Claude usage limit lifts, while it is still in the future."""
+        v = self.store.get("outreach_paused_until", "")
+        t = datetime.fromisoformat(v) if v else None
+        return t if t and t > datetime.now(timezone.utc) else None
+
     def room(self) -> int:
         """Founders that could still be booked: free slots left today (UTC), as a rough count for the UI."""
         return max(0, self.daily_limit - self.scheduled_today())
@@ -261,32 +312,35 @@ class Outreacher:
     async def draft(self, f: Founder, page_text: str, track: str) -> dict:
         catalog_names = project_names((REFERENCES / "projects.md").read_text())
         details = (
-            f"{TRACKS[track]}\n\n"
+            f"{TRACKS[track]}{ask_for(f)}\n\n"
             f"Recipient: {f.name}, {f.role} at {f.company or 'unknown company'}\n"
             f"Location: {f.location or 'unknown'}\nCompany website: {f.company_website or 'unknown'}\n"
             f"Email: {f.email} (listed on {f.email_source})\n"
             f"Company description (from scraping): {f.company_description}\nBio: {f.bio}\n\n"
             f"=== PAGE TEXT from {f.email_source} ===\n{page_text[:12000]}"
         )
-        prompt = f"{TASK}\n\n=== FOUNDER ===\n{details}"
-        with tempfile.TemporaryDirectory(prefix="founder-scout-") as tmp:
-            schema, out = Path(tmp) / "schema.json", Path(tmp) / "draft.json"
-            schema.write_text(json.dumps(DRAFT_SCHEMA))
-            # Read-only sandbox rooted in the skill, so its relative ../tailor/references paths resolve.
-            proc = await asyncio.create_subprocess_exec(
-                CODEX_BIN, "exec", "-s", "read-only", "--ephemeral", "--skip-git-repo-check",
-                "-C", str(SKILL_DIR), "-c", f'model_reasoning_effort="{CODEX_EFFORT}"',
-                "--output-schema", str(schema), "-o", str(out), "-",
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CODEX_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise RuntimeError("codex timed out")
-            if proc.returncode != 0 or not out.exists() or not out.read_text().strip():
-                raise RuntimeError(f"codex exited {proc.returncode}: {err.decode(errors='replace')[-300:]}")
-            d = json.loads(out.read_text())
+        prompt = f"{TASK}\n\n=== RECIPIENT ===\n{details}"
+        # Read-only tools, run from the skill dir so its relative ../tailor/references paths resolve.
+        proc = await asyncio.create_subprocess_exec(
+            CLAUDE_BIN, "-p", "--output-format", "json", "--json-schema", json.dumps(DRAFT_SCHEMA),
+            "--tools", "Read,Grep,Glob", "--add-dir", str(REFERENCES), "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT,
+            "--no-session-persistence",
+            cwd=str(SKILL_DIR),
+            # Drop any API key so claude uses the claude.ai login instead.
+            env={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"},
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CLAUDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("claude timed out")
+        res = json.loads(out) if out.strip() else {}
+        # Newer CLIs print a list of events; the final one is the result.
+        res = res[-1] if isinstance(res, list) and res else res
+        d = None if proc.returncode or res.get("is_error") else res.get("structured_output")
+        if not d:
+            raise RuntimeError(f"claude exited {proc.returncode}: {res.get('result') or err.decode(errors='replace')[-300:]}")
         d["projects"] = [p for p in d["projects"] if p in catalog_names]
         if d["fit"] == "project" and not d["projects"]:
             d["fit"] = "fallback"
@@ -317,7 +371,7 @@ class Outreacher:
             "purpose": d["purpose"][:500],
             "source_url": f.email_source,
             "source_excerpt": excerpt_for(text, f.email.lower()),
-            "campaign": f"founder-scout-{track}",
+            "campaign": f"founder-scout-{track}" + ("-referral" if f.kind in ("department_head", "employee") else ""),
             "subject": d["subject"][:300],
             "body": d["body"],
             "send": send,
@@ -351,7 +405,17 @@ class Outreacher:
         ).fetchone()
         return row is not None
 
-    async def process(self, f: Founder, send: bool = True, dry_run: bool = False) -> Result:
+    async def process(self, f: Founder, dry_run: bool = False,
+                      confirm: Callable[[Result], Awaitable[bool]] | None = None, send: bool = False) -> Result:
+        """Draft one founder's email and hand it to the tracker.
+
+        Emails are LLM-drafted from scraped page text, so nothing is sent without a human
+        reading it first. Without ``confirm`` the tracker stores a draft (``send: false``) for
+        review on its dashboard. With ``confirm``, the drafted email is shown to the caller
+        and queued for sending only when ``confirm`` returns True. ``send=True`` queues it
+        for its morning slot without a confirmation (used by auto-outreach).
+        """
+        send = send or confirm is not None
         local = f.email.split("@")[0].lower()
         if local in ROLE_INBOXES or self.company_contacted(f):
             result = Result(f, track_for(f), "skipped", "role inbox" if local in ROLE_INBOXES else "company already contacted")
@@ -367,6 +431,11 @@ class Outreacher:
         try:
             result, payload = await self.prepare(f, send)
             result.tz = tz
+            if payload and confirm is not None and not dry_run and not await confirm(result):
+                # Declined or timed out: nothing is posted or recorded, so the founder stays pending.
+                result.decision, result.reason = "cancelled", "not confirmed by a human"
+                self.log(f"outreach {f.name} <{f.email}>: cancelled before sending")
+                return result
             if payload:
                 payload["send_at"] = result.send_at = slot.isoformat(timespec="seconds")
             if payload and not dry_run:
@@ -380,11 +449,18 @@ class Outreacher:
         return result
 
     async def run(self, limit: int | None = None) -> list[Result]:
-        """Book pending founders into recipients' morning slots until the horizon is full."""
+        """Draft emails for pending founders and queue each in its own morning send slot."""
+        if self.paused_until():
+            return []
         results = []
         for f in self.pending(limit if limit is not None else self.daily_limit):
-            r = await self.process(f)
+            r = await self.process(f, send=True)
             if r.decision == "deferred":
                 break
             results.append(r)
+            reset = limit_reset(r.reason) if r.decision == "error" else None
+            if reset:
+                # Claude usage limit: the rest stay pending until it lifts.
+                self.store.set("outreach_paused_until", reset.isoformat())
+                break
         return results
