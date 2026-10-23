@@ -196,6 +196,37 @@ class Result:
     tz: str = ""
 
 
+RESET_RE = re.compile(r"resets (?:(\w{3} \d{1,2}),? )?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", re.I)
+
+
+def limit_reset(reason: str, now: datetime | None = None) -> datetime | None:
+    """When a Claude usage limit lifts, from 'session limit · resets 4:10pm (Europe/Berlin)'.
+
+    None when the reason is not a usage limit. An unparseable reset time falls back to one hour.
+    """
+    if "claude" not in reason or "limit" not in reason:
+        return None
+    now = now or datetime.now(timezone.utc)
+    m = RESET_RE.search(reason)
+    if not m:
+        return now + timedelta(hours=1)
+    day, hour, minute, ampm, tz = m.groups()
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        return now + timedelta(hours=1)
+    hour = int(hour) % 12 + (12 if ampm.lower() == "pm" else 0)
+    local = now.astimezone(zone)
+    if day:
+        d = datetime.strptime(f"{day} {local.year}", "%b %d %Y").date()
+    else:
+        d = local.date()
+    t = datetime(d.year, d.month, d.day, hour, int(minute or 0), tzinfo=zone)
+    if t <= local:
+        t += timedelta(days=1)
+    return t.astimezone(timezone.utc)
+
+
 class Outreacher:
     def __init__(self, store: Store, scout: Scout, log=print):
         self.store = store
@@ -244,6 +275,12 @@ class Outreacher:
                     return u
                 t += gap
         return None
+
+    def paused_until(self) -> datetime | None:
+        """The time a hit Claude usage limit lifts, while it is still in the future."""
+        v = self.store.get("outreach_paused_until", "")
+        t = datetime.fromisoformat(v) if v else None
+        return t if t and t > datetime.now(timezone.utc) else None
 
     def room(self) -> int:
         """Founders that could still be booked: free slots left today (UTC), as a rough count for the UI."""
@@ -413,10 +450,17 @@ class Outreacher:
 
     async def run(self, limit: int | None = None) -> list[Result]:
         """Draft emails for pending founders and queue each in its own morning send slot."""
+        if self.paused_until():
+            return []
         results = []
         for f in self.pending(limit if limit is not None else self.daily_limit):
             r = await self.process(f, send=True)
             if r.decision == "deferred":
                 break
             results.append(r)
+            reset = limit_reset(r.reason) if r.decision == "error" else None
+            if reset:
+                # Claude usage limit: the rest stay pending until it lifts.
+                self.store.set("outreach_paused_until", reset.isoformat())
+                break
         return results
