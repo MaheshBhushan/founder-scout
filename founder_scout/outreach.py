@@ -29,7 +29,8 @@ SKILL_DIR = Path.home() / ".claude" / "skills" / "outreach"
 REFERENCES = Path.home() / ".claude" / "skills" / "tailor" / "references"
 TRACKER_CONFIG = Path.home() / ".config" / "tailor-tracker"
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
-CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "medium")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 CLAUDE_TIMEOUT = 600
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
@@ -285,7 +286,7 @@ class Outreacher:
         # Read-only tools, run from the skill dir so its relative ../tailor/references paths resolve.
         proc = await asyncio.create_subprocess_exec(
             CLAUDE_BIN, "-p", "--output-format", "json", "--json-schema", json.dumps(DRAFT_SCHEMA),
-            "--tools", "Read,Grep,Glob", "--add-dir", str(REFERENCES), "--effort", CLAUDE_EFFORT,
+            "--tools", "Read,Grep,Glob", "--add-dir", str(REFERENCES), "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT,
             "--no-session-persistence",
             cwd=str(SKILL_DIR),
             # Drop any API key so claude uses the claude.ai login instead.
@@ -368,15 +369,16 @@ class Outreacher:
         return row is not None
 
     async def process(self, f: Founder, dry_run: bool = False,
-                      confirm: Callable[[Result], Awaitable[bool]] | None = None) -> Result:
+                      confirm: Callable[[Result], Awaitable[bool]] | None = None, send: bool = False) -> Result:
         """Draft one founder's email and hand it to the tracker.
 
         Emails are LLM-drafted from scraped page text, so nothing is sent without a human
         reading it first. Without ``confirm`` the tracker stores a draft (``send: false``) for
         review on its dashboard. With ``confirm``, the drafted email is shown to the caller
-        and queued for sending only when ``confirm`` returns True.
+        and queued for sending only when ``confirm`` returns True. ``send=True`` queues it
+        for its morning slot without a confirmation (used by auto-outreach).
         """
-        send = confirm is not None
+        send = send or confirm is not None
         local = f.email.split("@")[0].lower()
         if local in ROLE_INBOXES or self.company_contacted(f):
             result = Result(f, track_for(f), "skipped", "role inbox" if local in ROLE_INBOXES else "company already contacted")
@@ -410,10 +412,10 @@ class Outreacher:
         return result
 
     async def run(self, limit: int | None = None) -> list[Result]:
-        """Draft emails for pending founders into the tracker for human review; sends nothing."""
+        """Draft emails for pending founders and queue each in its own morning send slot."""
         results = []
         for f in self.pending(limit if limit is not None else self.daily_limit):
-            r = await self.process(f)
+            r = await self.process(f, send=True)
             if r.decision == "deferred":
                 break
             results.append(r)

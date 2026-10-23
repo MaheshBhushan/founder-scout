@@ -261,10 +261,14 @@ def clean_url(url: str) -> str:
     return url if "://" in url else f"https://{url}"
 
 
+# Button or link text that page-to-markdown glues onto an address ("name@x.comCopy").
+GLUED_SUFFIX = re.compile(r"(\.(?:com|net|org|de|io|ai|co|eu))(?:copy|copied|weitere|mehr|more|email|e-mail|kontakt|contact)$")
+
+
 def page_emails(text: str) -> list[str]:
     found = []
     for m in EMAIL_RE.findall(text or ""):
-        e = m.strip(".").lower()
+        e = GLUED_SUFFIX.sub(r"\1", m.strip(".").lower())
         if not JUNK_EMAIL.search(e) and e not in found:
             found.append(e)
     return found
