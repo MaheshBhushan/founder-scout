@@ -130,7 +130,7 @@ class FounderBot(discord.Client):
         self.auto_enabled = interval > 0 and self.store.get("auto_enabled", "true") == "true"
         self.outreach = Outreacher(self.store, self.scout, log=log.info)
         # Persistent like auto_enabled: after each automatic run, draft emails for new founders
-        # into the tracker for review. Off unless someone turns it on; it never sends by itself.
+        # and queue them in morning send slots. Off unless someone turns it on.
         self.outreach_auto = self.store.get("outreach_auto", "false") == "true"
         self._register()
 
@@ -292,7 +292,7 @@ class FounderBot(discord.Client):
             drafted = sum(r.decision not in ("skipped", "error") for r in results)
             await inter.followup.send(f"Outreach: {drafted} drafted for review in the tracker, {len(results) - drafted} skipped or failed. Nothing was sent.")
 
-        @tree.command(name="outreach_auto", description="Draft emails for new founders after each scouting run (drafts only, never sends)")
+        @tree.command(name="outreach_auto", description="Draft and schedule emails for new founders after each scouting run")
         async def outreach_auto(inter: discord.Interaction, enabled: bool):
             self.outreach_auto = enabled
             self.store.set("outreach_auto", "true" if enabled else "false")
