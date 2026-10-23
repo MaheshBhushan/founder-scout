@@ -456,6 +456,7 @@ class Outreacher:
         for f in self.pending(limit if limit is not None else self.daily_limit):
             r = await self.process(f, send=True)
             if r.decision == "deferred":
+                self.log(f"outreach paused: {r.reason}; {len(self.pending(10000))} founders wait for free slots")
                 break
             results.append(r)
             reset = limit_reset(r.reason) if r.decision == "error" else None
