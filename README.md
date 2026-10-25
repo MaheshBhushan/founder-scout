@@ -4,8 +4,10 @@ A Discord bot that finds startup founders worldwide and posts their profiles, in
 
 ## How it works
 
-1. **Discovery.** Firecrawl search runs queries against YC company pages, Product Hunt, Indie Hackers, Wellfound, and company "about" pages. If `EXA_API_KEY` is set, Exa semantic search adds founders' personal sites, company team pages, and founder blog posts.
-2. **Extraction.** Firecrawl scrapes each page and returns structured data (name, role, company, location, LinkedIn, X, bio) for founders, department heads (CTO, Head of Engineering, Data, AI, Product, engineering managers), and employees on the team. Two Firecrawl and two Exa queries target team and leadership pages. Department heads and employees are kept only with a personal address, since a shared inbox does not reach them.
+This branch needs no paid scraping API. It uses no Exa or Firecrawl key.
+
+1. **Discovery.** Web search runs queries against YC company pages, Product Hunt, Indie Hackers, Wellfound, company "about" and team pages, and founders' personal sites and blogs. Search uses the open-source [ddgs](https://github.com/deedy5/ddgs) metasearch library (DuckDuckGo, Bing, Brave and others) and needs no key. Set `SEARXNG_URL` to query a self-hosted [SearXNG](https://github.com/searxng/searxng) instance instead.
+2. **Extraction.** The built-in scraper (`founder_scout/scraper.py`) fetches each page with httpx and converts the HTML to Markdown with BeautifulSoup. It decodes `mailto:` links and Cloudflare-obfuscated addresses, and it keeps schema.org `Person` JSON-LD. When a page renders client-side and [Playwright](https://playwright.dev/python/) is installed, the scraper renders it in headless Chromium. `claude -p` (default model `claude-haiku-5-5`, set with `EXTRACT_MODEL`) then turns the page text into structured data (name, role, company, location, LinkedIn, X, bio) for founders, department heads (CTO, Head of Engineering, Data, AI, Product, engineering managers), and employees on the team. Several queries target team and leadership pages. Department heads and employees are kept only with a personal address, since a shared inbox does not reach them.
 3. **Email verification.** The bot keeps an email only when the address appears literally in the scraped page text, so model-guessed addresses are dropped. When a founder page lists no email, the bot checks the company homepage and `/contact` page. Each email is labelled `personal` (matches the founder's name), `company inbox` (hello@, founders@), or `listed`, and each email links to the page where it was found.
 4. **Storage.** SQLite deduplicates by person, email, and URL, so the bot posts each founder once and scrapes each page once.
 
@@ -14,7 +16,7 @@ A Discord bot that finds startup founders worldwide and posts their profiles, in
 1. Create an application at https://discord.com/developers/applications, open **Bot**, and copy the token.
 2. Invite the bot with your application's Client ID:
    `https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applications.commands&permissions=117760`
-3. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`, `DISCORD_CHANNEL_ID`, and `FIRECRAWL_API_KEY`. Set `DISCORD_GUILD_ID` to make slash commands appear in your server immediately.
+3. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN` and `DISCORD_CHANNEL_ID`. Extraction uses the `claude` CLI and its claude.ai login. Set `DISCORD_GUILD_ID` to make slash commands appear in your server immediately.
 4. Run it:
 
 ```sh
@@ -199,7 +201,13 @@ fail closed rather than queueing an unverified address.
 
 ## Cost
 
-Each scraped page costs about 5 Firecrawl credits with JSON extraction, plus 1 credit per company-site check. A default run scrapes 8 pages, which uses about 40–60 credits. Set `MAX_PAGES_PER_RUN` and `AUTO_INTERVAL_MINUTES` to control spending.
+Search and scraping are free. Each extracted page uses one `claude -p` call on your Claude plan; company-site checks use none. A default run extracts 8 pages. Set `MAX_PAGES_PER_RUN` and `AUTO_INTERVAL_MINUTES` to control usage. Search engines rate-limit heavy use; the scout retries with backoff, and a self-hosted SearXNG avoids the limits.
+
+Optional JavaScript rendering:
+
+```sh
+uv pip install playwright && uv run playwright install chromium
+```
 
 ## Data protection
 

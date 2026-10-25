@@ -1,7 +1,7 @@
 """Discovery, extraction, and storage for founder profiles.
 
-Discovery finds candidate pages through Exa (semantic search) and Firecrawl search.
-Extraction scrapes each page with Firecrawl and asks for structured founder data.
+Discovery finds candidate pages through open-source web search (ddgs or SearXNG).
+Extraction fetches each page with the built-in scraper and asks Claude for structured founder data.
 An email is kept only when it appears literally in scraped page text, so the model
 cannot invent addresses.
 """
@@ -19,8 +19,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-FIRECRAWL = "https://api.firecrawl.dev/v2"
-EXA = "https://api.exa.ai"
+from . import scraper
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}")
 JUNK_EMAIL = re.compile(
@@ -30,8 +29,8 @@ JUNK_EMAIL = re.compile(
 )
 GENERIC_LOCAL = {"hello", "hi", "info", "contact", "team", "founders", "founder", "office", "mail", "support", "sales", "press", "jobs", "careers"}
 
-# Firecrawl cannot scrape these, and the profiles do not list emails.
-SKIP_DOMAINS = ("linkedin.com", "facebook.com", "instagram.com", "x.com", "twitter.com", "tiktok.com", "youtube.com")
+# These block scrapers, and the profiles do not list emails.
+SKIP_DOMAINS = ("bing.com", "duckduckgo.com", "google.com", "linkedin.com", "facebook.com", "instagram.com", "x.com", "twitter.com", "tiktok.com", "youtube.com")
 # Lead-selling directories hide emails behind paywalls; scraping them wastes credits.
 LOW_VALUE_DOMAINS = ("vcbacked.co", "connectsafely.ai", "rocketreach.co", "zoominfo.com", "apollo.io", "signalhire.com", "contactout.com", "lusha.com")
 
@@ -53,8 +52,8 @@ REGION_TIERS = [
 # Within a tier, each pass covers every city with one sector, so consecutive runs change city.
 ROTATION = [(sector, city) for tier in REGION_TIERS for sector in SECTORS for city in tier]
 
-# Query templates per source. {topic} is the user query or a sector, {region} a city.
-FIRECRAWL_TEMPLATES = [
+# Search query templates. {topic} is the user query or a sector, {region} a city.
+SEARCH_TEMPLATES = [
     "site:ycombinator.com/companies {topic} {region}",
     "{topic} startup {region} founder \"email me\" OR \"reach me at\"",
     "{topic} startup {region} \"about us\" founders team contact",
@@ -64,13 +63,10 @@ FIRECRAWL_TEMPLATES = [
     # Team and leadership pages list department heads and engineers who can refer Mahesh internally.
     "{topic} startup {region} \"our team\" \"head of engineering\" OR \"VP engineering\" OR \"engineering manager\"",
     "{topic} company {region} \"meet the team\" engineers data scientists",
-]
-EXA_TEMPLATES = [
-    ("personal site", "personal website of a {topic} startup founder based in {region}"),
-    ("company", "early-stage {topic} startup in {region} with founders listed on the team page"),
-    (None, "blog post by the founder of a {topic} startup in {region} sharing their contact email"),
-    ("company", "{topic} startup in {region} whose team page lists the head of engineering, data, or AI and its engineers"),
-    ("personal site", "personal website of an engineering manager or senior engineer at a {topic} startup in {region}"),
+    # Personal sites and founder blogs, which keyword search finds less often than directories.
+    "{topic} startup founder {region} personal website about me",
+    "founder of {topic} startup {region} blog \"contact me\" email",
+    "{topic} startup {region} engineering manager personal website",
 ]
 
 PROFILE_SCHEMA = {
@@ -139,20 +135,13 @@ class Founder:
 
 @dataclass
 class Settings:
-    firecrawl_key: str
-    exa_key: str = ""
     max_pages: int = 8
     follow_company_site: bool = True
     db_path: str = "founders.db"
 
     @classmethod
     def from_env(cls) -> "Settings":
-        key = os.environ.get("FIRECRAWL_API_KEY", "")
-        if not key:
-            raise SystemExit("FIRECRAWL_API_KEY is not set")
         return cls(
-            firecrawl_key=key,
-            exa_key=os.environ.get("EXA_API_KEY", ""),
             max_pages=int(os.environ.get("MAX_PAGES_PER_RUN", "8")),
             follow_company_site=os.environ.get("FOLLOW_COMPANY_SITE", "true").lower() == "true",
             db_path=os.environ.get("DB_PATH", "founders.db"),
@@ -301,7 +290,7 @@ def pick_email(name: str, claimed: str, emails: list[str], company_site: str = "
     return "", ""
 
 
-# ---------- API clients ----------
+# ---------- scraping ----------
 
 class Scout:
     def __init__(self, settings: Settings, store: Store, log=print):
@@ -309,53 +298,36 @@ class Scout:
         self.store = store
         self.log = log
         self.http = httpx.AsyncClient(timeout=90)
-        self.fc_slots = asyncio.Semaphore(2)  # low Firecrawl plans reject more parallel requests
+        self.search_slots = asyncio.Semaphore(2)  # search engines block bursts of parallel queries
 
     async def close(self) -> None:
         await self.http.aclose()
 
-    async def _firecrawl(self, path: str, body: dict) -> dict:
-        """POST to Firecrawl, retrying with backoff when rate limited."""
-        for attempt in range(5):
-            async with self.fc_slots:
-                r = await self.http.post(f"{FIRECRAWL}/{path}", headers={"Authorization": f"Bearer {self.s.firecrawl_key}"}, json=body)
-            if r.status_code != 429 or attempt == 4:
-                r.raise_for_status()
-                return r.json()
-            wait = float(r.headers.get("retry-after") or 0) or 5 * 2 ** attempt
-            self.log(f"firecrawl rate limited, retrying in {wait:.0f}s")
-            await asyncio.sleep(min(wait, 60))
-        return {}
-
-    async def firecrawl_search(self, query: str, limit: int = 5) -> list[str]:
-        data = await self._firecrawl("search", {"query": query, "limit": limit})
-        return [x["url"] for x in data.get("data", {}).get("web", []) if x.get("url")]
-
-    async def exa_search(self, query: str, category: str | None, limit: int = 5) -> list[str]:
-        body = {"query": query, "type": "auto", "numResults": limit}
-        if category:
-            body["category"] = category
-        r = await self.http.post(f"{EXA}/search", headers={"x-api-key": self.s.exa_key}, json=body)
-        if r.status_code == 400 and category:  # category names change between API versions
-            return await self.exa_search(query, None, limit)
-        r.raise_for_status()
-        return [x["url"] for x in r.json().get("results", []) if x.get("url")]
+    async def search(self, query: str, limit: int = 5) -> list[str]:
+        """Web search, retrying with backoff when the engine rate limits."""
+        for attempt in range(3):
+            try:
+                async with self.search_slots:
+                    return await scraper.search(self.http, query, limit)
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                self.log(f"search failed ({e}), retrying in {5 * 2 ** attempt}s")
+                await asyncio.sleep(5 * 2 ** attempt)
+        return []
 
     async def scrape(self, url: str, extract: bool) -> dict:
-        formats: list = ["markdown"]
+        """Fetch a page as Markdown text, plus extracted profile JSON when ``extract`` is set."""
+        markdown = await scraper.scrape_markdown(self.http, url)
+        data: dict = {"markdown": markdown}
         if extract:
-            formats.append({"type": "json", "prompt": PROFILE_PROMPT, "schema": PROFILE_SCHEMA})
-        data = await self._firecrawl("scrape", {"url": url, "formats": formats, "onlyMainContent": False, "timeout": 60000})
-        return data.get("data", {})
-
+            data["json"] = await scraper.extract_json(markdown, url, PROFILE_PROMPT, PROFILE_SCHEMA)
+        return data
     # ---------- pipeline ----------
 
     async def discover(self, topic: str, region: str) -> list[tuple[str, str]]:
         """Return (url, source) candidates from every configured source."""
-        jobs = []
-        if self.s.exa_key:  # Exa first: its semantic results hit founder pages more often
-            jobs += [(f"exa:{c or 'web'}", self.exa_search(t.format(topic=topic, region=region), c, 6)) for c, t in EXA_TEMPLATES]
-        jobs += [(f"firecrawl:{t.split()[0]}", self.firecrawl_search(t.format(topic=topic, region=region).strip(), 5)) for t in FIRECRAWL_TEMPLATES]
+        jobs = [(f"search:{t.split()[0]}", self.search(t.format(topic=topic, region=region).strip(), 6)) for t in SEARCH_TEMPLATES]
         results = await asyncio.gather(*(j for _, j in jobs), return_exceptions=True)
         out, seen = [], set()
         # Interleave sources so a small page budget still samples each of them.
@@ -458,19 +430,26 @@ class Scout:
         new: list[Founder] = []
         sem = asyncio.Semaphore(3)
 
-        async def one(url: str, src: str) -> list[Founder]:
+        async def one(url: str, src: str) -> list[Founder] | None:
             async with sem:
                 try:
                     return await self.extract(url, src)
-                except httpx.HTTPError as e:
-                    self.log(f"scrape failed {url}: {e}")
+                except (httpx.HTTPError, RuntimeError, ValueError) as e:
+                    self.log(f"scrape failed {url}: {str(e).splitlines()[0]}")
                     self.store.mark_seen(url)
-                    return []
+                    return None
 
-        for batch in await asyncio.gather(*(one(u, s) for u, s in candidates[:budget])):
-            for f in batch:
-                if self.store.add(f):
-                    new.append(f)
+        # Blocked or unreachable pages cost nothing, so they do not count against the page budget.
+        done = 0
+        while done < budget and candidates:
+            wave, candidates = candidates[:budget - done], candidates[budget - done:]
+            for batch in await asyncio.gather(*(one(u, s) for u, s in wave)):
+                if batch is None:
+                    continue
+                done += 1
+                for f in batch:
+                    if self.store.add(f):
+                        new.append(f)
         n_ref = sum(1 for f in new if f.kind != "founder")
         self.log(f"{len(new)} new people ({n_ref} department heads or employees), {sum(1 for f in new if f.email)} with email")
         return new

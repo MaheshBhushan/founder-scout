@@ -1,9 +1,16 @@
 [project]
 name = "founder-scout"
 version = "0.1.0"
-description = "Discord bot that finds startup founders and their publicly listed emails via Exa and Firecrawl"
+description = "Discord bot that finds startup founders and their publicly listed emails with open-source search and a built-in scraper"
 requires-python = ">=3.11"
-dependencies = ["discord.py>=2.4", "httpx>=0.27", "python-dotenv>=1.0"]
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "ddgs>=9.16.1",
+    "discord.py>=2.4",
+    "httpx>=0.27",
+    "lxml>=6.1.3",
+    "python-dotenv>=1.0",
+]
 
 [project.scripts]
 founder-scout = "founder_scout.cli:main"
