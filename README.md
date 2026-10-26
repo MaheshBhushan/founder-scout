@@ -43,7 +43,7 @@ The bot never sends an LLM-drafted email without a human reading it first. Batch
 - **Referrals:** department heads and employees get a referral ask. The email asks them to refer Mahesh or point him to the person who hires. It never asks them to hire him directly. These emails use the `founder-scout-<track>-referral` campaign.
 - **Fit:** the draft cites one or two catalog projects that overlap with what the company builds. When none fit honestly, it falls back to a curiosity-led email about learning a field from first principles.
 - **Checks:** before drafting, the bot re-fetches the page the address came from and skips the founder if the address is gone. The tracker refuses to auto-send without that page excerpt and never emails an address twice.
-- **Schedule:** each email is booked into the recipient's weekday morning, 08:00 to 11:00 in their time zone (worked out from their location, else their domain, else Berlin), in 5-minute slots, up to 3 days ahead. The tailor tracker sends it when the slot arrives, at least 4 minutes after the previous scheduled email.
+- **Schedule:** each email is booked into the recipient's weekday morning, 08:00 to 11:00 in their time zone (worked out from the city or country in their location, else the country the extraction model reports, else the email or website country domain, else the place the run searched, else Berlin), in 5-minute slots, up to 3 days ahead. The tailor tracker sends it when the slot arrives, at least 4 minutes after the previous scheduled email. When one time zone's mornings are fully booked, the bot moves on to founders in other zones.
 - **Limits:** `OUTREACH_DAILY_LIMIT` (default 30) emails per day, inside the tracker's shared cap of 40.
 
 | Command | Effect |
@@ -165,7 +165,7 @@ The request goes only to `POST /api/outreach`, with
 
 ## Automatic runs
 
-Each automatic run takes the next sector and city pair from a fixed rotation. Consecutive runs alternate between 12 German cities, 18 other European cities, and 18 cities outside Europe (US, UK, India, Singapore and others), so each region gets one run in three. Germany has fewer cities, so its pairs repeat more often. The position is stored in the database, so a restart continues where the last run stopped. `uv run founder-scout next 10` prints the upcoming pairs.
+Each automatic run takes the next sector and place pair from a fixed rotation (`founder_scout/geo.py`). Consecutive runs cycle through six regions: Germany, the rest of Europe, North America, Latin America, Asia-Pacific, and the Middle East and Africa, so each region gets one run in six. Inside each region the bot visits every hub with every sector in a fixed shuffled order, so no city comes first. Germany and Latin America have fewer hubs, so their pairs repeat more often. The position is stored in the database, so a restart continues where the last run stopped. `uv run founder-scout next 10` prints the upcoming pairs.
 
 ## Running as a service
 

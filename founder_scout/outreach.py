@@ -23,7 +23,9 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from .scout import REGION_TIERS, Founder, Scout, Store, domain, page_emails
+from . import geo
+from .geo import GERMAN_PLACES
+from .scout import Founder, Scout, Store, domain, page_emails
 
 SKILL_DIR = Path.home() / ".claude" / "skills" / "outreach"
 REFERENCES = Path.home() / ".claude" / "skills" / "tailor" / "references"
@@ -33,48 +35,14 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 CLAUDE_TIMEOUT = 600
 
-GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
-
-# Time zone per place, matched as a substring of the founder's location (first match wins),
-# then by the address or website country domain. Unknown places default to Berlin.
-PLACE_TZ = [
-    (("germany", "deutschland", "berlin", "munich", "münchen", "hamburg", "frankfurt", "cologne", "köln", "stuttgart",
-      "düsseldorf", "leipzig", "karlsruhe", "dresden", "aachen", "nuremberg", "nürnberg"), "Europe/Berlin"),
-    (("london", "united kingdom", " uk", "england", "scotland"), "Europe/London"),
-    (("dublin", "ireland"), "Europe/Dublin"), (("lisbon", "portugal"), "Europe/Lisbon"),
-    (("paris", "france"), "Europe/Paris"), (("amsterdam", "netherlands"), "Europe/Amsterdam"),
-    (("brussels", "belgium"), "Europe/Brussels"), (("zurich", "zürich", "switzerland"), "Europe/Zurich"),
-    (("vienna", "wien", "austria"), "Europe/Vienna"), (("madrid", "barcelona", "spain"), "Europe/Madrid"),
-    (("milan", "italy"), "Europe/Rome"), (("copenhagen", "denmark"), "Europe/Copenhagen"),
-    (("stockholm", "sweden"), "Europe/Stockholm"), (("oslo", "norway"), "Europe/Oslo"),
-    (("helsinki", "finland"), "Europe/Helsinki"), (("tallinn", "estonia"), "Europe/Tallinn"),
-    (("warsaw", "poland"), "Europe/Warsaw"), (("prague", "czech"), "Europe/Prague"),
-    (("san francisco", "bay area", "palo alto", "los angeles", "seattle", "california"), "America/Los_Angeles"),
-    (("new york", "boston", "toronto", "miami"), "America/New_York"), (("austin", "texas", "chicago"), "America/Chicago"),
-    (("mexico",), "America/Mexico_City"), (("são paulo", "sao paulo", "brazil"), "America/Sao_Paulo"),
-    (("bangalore", "bengaluru", "india", "mumbai", "delhi", "hyderabad"), "Asia/Kolkata"),
-    (("singapore",), "Asia/Singapore"), (("tel aviv", "israel"), "Asia/Jerusalem"), (("dubai", "uae"), "Asia/Dubai"),
-    (("lagos", "nigeria"), "Africa/Lagos"), (("nairobi", "kenya"), "Africa/Nairobi"),
-    (("cape town", "south africa"), "Africa/Johannesburg"), (("sydney", "australia"), "Australia/Sydney"),
-    (("tokyo", "japan"), "Asia/Tokyo"), (("seoul", "korea"), "Asia/Seoul"), (("jakarta", "indonesia"), "Asia/Jakarta"),
-]
-TLD_TZ = {"de": "Europe/Berlin", "at": "Europe/Vienna", "ch": "Europe/Zurich", "uk": "Europe/London", "fr": "Europe/Paris",
-          "nl": "Europe/Amsterdam", "es": "Europe/Madrid", "it": "Europe/Rome", "se": "Europe/Stockholm", "in": "Asia/Kolkata",
-          "sg": "Asia/Singapore", "il": "Asia/Jerusalem", "jp": "Asia/Tokyo", "br": "America/Sao_Paulo", "ca": "America/Toronto"}
 # Send window in the recipient's local time, Monday to Friday; slots every SLOT_MINUTES.
 MORNING_START, MORNING_END, SLOT_MINUTES, HORIZON_DAYS = (8, 0), (11, 0), 5, 3
 
 
 def tz_for(f: Founder) -> str:
-    loc = f" {(f.location or '').lower()}"
-    for places, tz in PLACE_TZ:
-        if any(p in loc for p in places):
-            return tz
-    for host in (f.email.split("@")[-1], domain(f.company_website or "")):
-        tld = host.rsplit(".", 1)[-1] if host else ""
-        if tld in TLD_TZ:
-            return TLD_TZ[tld]
-    return "Europe/Berlin"
+    """The recipient's time zone (see geo.tz_for); unknown places default to Berlin."""
+    hosts = (f.email.split("@")[-1], domain(f.company_website or ""))
+    return geo.tz_for(f.location, f.country, hosts, f.search_region) or "Europe/Berlin"
 
 
 # Shared inboxes that never belong to a job or collaboration enquiry.
@@ -449,19 +417,35 @@ class Outreacher:
         return result
 
     async def run(self, limit: int | None = None) -> list[Result]:
-        """Draft emails for pending founders and queue each in its own morning send slot."""
+        """Draft emails for pending founders and queue each in its own morning send slot.
+
+        A founder whose time zone has no free morning slot is passed over, so one busy
+        zone does not hold back founders elsewhere in the world.
+        """
         if self.paused_until():
             return []
-        results = []
-        for f in self.pending(limit if limit is not None else self.daily_limit):
+        limit = limit if limit is not None else self.daily_limit
+        results: list[Result] = []
+        full_zones: set[str] = set()
+        waiting = 0
+        for f in self.pending(10000):
+            if len(results) >= limit:
+                break
+            if tz_for(f) in full_zones:
+                waiting += 1
+                continue
             r = await self.process(f, send=True)
             if r.decision == "deferred":
-                self.log(f"outreach paused: {r.reason}; {len(self.pending(10000))} founders wait for free slots")
-                break
+                full_zones.add(r.tz)
+                waiting += 1
+                continue
             results.append(r)
             reset = limit_reset(r.reason) if r.decision == "error" else None
             if reset:
                 # Claude usage limit: the rest stay pending until it lifts.
                 self.store.set("outreach_paused_until", reset.isoformat())
                 break
+        if full_zones:
+            self.log(f"outreach: no free morning slot in the next {HORIZON_DAYS} days in {', '.join(sorted(full_zones))}; "
+                     f"{waiting} founders there wait for free slots")
         return results

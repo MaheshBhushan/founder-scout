@@ -63,7 +63,7 @@ def main() -> None:
         Store(Settings.from_env().db_path).set("auto_enabled", "true" if cmd == "resume" else "false")
         print(f"auto-scout {'resumed' if cmd == 'resume' else 'paused'}")
     elif cmd == "next":
-        from .scout import ROTATION
+        from .geo import ROTATION
         i = int(Store(Settings.from_env().db_path).get("rotation_index", "0"))
         for k in range(int(args[1]) if len(args) > 1 else 10):
             print(*ROTATION[(i + k) % len(ROTATION)], sep=" / ")

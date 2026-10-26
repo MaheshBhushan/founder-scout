@@ -20,6 +20,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from . import scraper
+from .geo import ROTATION
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}")
 JUNK_EMAIL = re.compile(
@@ -39,21 +40,6 @@ AGGREGATOR_DOMAINS = ("producthunt.com", "indiehackers.com", "ycombinator.com", 
 
 PLACEHOLDER_NAME = re.compile(r"\b(not|unknown|mentioned|n/a|none|founder|team|anonymous)\b|\b(john|jane) doe\b|\b(max|erika) mustermann\b|lorem ipsum", re.I)
 AGGREGATOR_NAMES = {"indiehackers", "producthunt", "ycombinator", "wellfound", "angellist", "crunchbase", "github", "medium", "substack"}
-
-SECTORS = ["AI", "fintech", "climate tech", "healthtech", "developer tools", "SaaS", "robotics", "edtech", "biotech", "e-commerce", "cybersecurity", "mobility"]
-# Automatic runs work through these tiers in order: Germany, rest of Europe, rest of the world.
-REGION_TIERS = [
-    ["Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne", "Stuttgart", "Düsseldorf", "Leipzig", "Karlsruhe", "Dresden", "Aachen", "Nuremberg"],
-    ["London", "Paris", "Amsterdam", "Stockholm", "Copenhagen", "Helsinki", "Oslo", "Zurich", "Vienna", "Madrid", "Barcelona", "Lisbon",
-     "Milan", "Dublin", "Warsaw", "Prague", "Tallinn", "Brussels"],
-    ["San Francisco", "New York", "Boston", "Austin", "Toronto", "Bangalore", "Singapore", "Tel Aviv", "Dubai", "Lagos", "Nairobi",
-     "Cape Town", "São Paulo", "Mexico City", "Sydney", "Tokyo", "Seoul", "Jakarta"],
-]
-# Within a tier, each pass covers every city with one sector, so consecutive runs change city.
-_TIER_PAIRS = [[(sector, city) for sector in SECTORS for city in tier] for tier in REGION_TIERS]
-# Consecutive runs alternate Germany, rest of Europe, rest of world, so every region gets steady coverage.
-# Shorter tiers repeat until the longest one has had a full pass.
-ROTATION = [pairs[k % len(pairs)] for k in range(max(map(len, _TIER_PAIRS))) for pairs in _TIER_PAIRS]
 
 # Search query templates. {topic} is the user query or a sector, {region} a city.
 SEARCH_TEMPLATES = [
@@ -79,6 +65,7 @@ PROFILE_SCHEMA = {
         "company_website": {"type": "string"},
         "company_description": {"type": "string"},
         "location": {"type": "string"},
+        "country": {"type": "string", "description": "ISO 3166-1 alpha-2 code of the country the company is based in, if the page states or clearly implies it"},
         "founders": {
             "type": "array",
             "items": {
@@ -118,6 +105,7 @@ class Founder:
     company_website: str = ""
     company_description: str = ""
     location: str = ""
+    country: str = ""  # ISO code from the extraction model; picks the time zone when the location names no known place
     email: str = ""
     email_type: str = ""  # "personal", "generic", or ""
     email_source: str = ""
@@ -127,6 +115,7 @@ class Founder:
     bio: str = ""
     source_url: str = ""
     found_via: str = ""
+    search_region: str = ""  # place the run searched; the last time zone fallback
     kind: str = "founder"  # "founder", "department_head", or "employee"; non-founders get a referral ask
     found_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     id: int | None = None
@@ -384,6 +373,7 @@ class Scout:
                 company_website=site,
                 company_description=(info.get("company_description") or "").strip()[:500],
                 location=(info.get("location") or "").strip(),
+                country=(info.get("country") or "").strip().lower()[:2],
                 email=email,
                 email_type=etype,
                 email_source=url if email else "",
@@ -451,6 +441,7 @@ class Scout:
                     continue
                 done += 1
                 for f in batch:
+                    f.search_region = region
                     if self.store.add(f):
                         new.append(f)
         n_ref = sum(1 for f in new if f.kind != "founder")
