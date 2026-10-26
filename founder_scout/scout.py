@@ -51,7 +51,10 @@ REGION_TIERS = [
      "Cape Town", "São Paulo", "Mexico City", "Sydney", "Tokyo", "Seoul", "Jakarta"],
 ]
 # Within a tier, each pass covers every city with one sector, so consecutive runs change city.
-ROTATION = [(sector, city) for tier in REGION_TIERS for sector in SECTORS for city in tier]
+_TIER_PAIRS = [[(sector, city) for sector in SECTORS for city in tier] for tier in REGION_TIERS]
+# Consecutive runs alternate Germany, rest of Europe, rest of world, so every region gets steady coverage.
+# Shorter tiers repeat until the longest one has had a full pass.
+ROTATION = [pairs[k % len(pairs)] for k in range(max(map(len, _TIER_PAIRS))) for pairs in _TIER_PAIRS]
 
 # Query templates per source. {topic} is the user query or a sector, {region} a city.
 FIRECRAWL_TEMPLATES = [
