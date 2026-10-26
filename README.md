@@ -165,7 +165,7 @@ The request goes only to `POST /api/outreach`, with
 
 ## Automatic runs
 
-Each automatic run takes the next sector and city pair from a fixed rotation. The rotation covers 12 German cities first, then 18 other European cities, then 18 cities outside Europe, and then starts over. The position is stored in the database, so a restart continues where the last run stopped. `uv run founder-scout next 10` prints the upcoming pairs.
+Each automatic run takes the next sector and city pair from a fixed rotation. Consecutive runs alternate between 12 German cities, 18 other European cities, and 18 cities outside Europe (US, UK, India, Singapore and others), so each region gets one run in three. Germany has fewer cities, so its pairs repeat more often. The position is stored in the database, so a restart continues where the last run stopped. `uv run founder-scout next 10` prints the upcoming pairs.
 
 ## Running as a service
 
