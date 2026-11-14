@@ -286,14 +286,16 @@ class Outreacher:
         """Founders that could still be booked: free slots left today (UTC), as a rough count for the UI."""
         return max(0, self.daily_limit - self.scheduled_today())
 
+    PENDING = ("FROM founders f LEFT JOIN outreach o ON o.founder_id=f.id "
+               "WHERE f.email != '' AND f.email_source != '' AND (o.founder_id IS NULL OR o.decision='error')")
+
     def pending(self, limit: int) -> list[Founder]:
-        rows = self.store.db.execute(
-            "SELECT f.* FROM founders f LEFT JOIN outreach o ON o.founder_id=f.id "
-            "WHERE f.email != '' AND f.email_source != '' AND (o.founder_id IS NULL OR o.decision='error') "
-            "ORDER BY f.email_type='personal' DESC, f.id DESC LIMIT ?",
-            (limit,),
-        )
+        rows = self.store.db.execute(f"SELECT f.* {self.PENDING} ORDER BY f.email_type='personal' DESC, f.id DESC LIMIT ?", (limit,))
         return [Store._row(r) for r in rows]
+
+    def backlog(self) -> int:
+        """Founders with an address that no email has been drafted for yet."""
+        return self.store.db.execute(f"SELECT count(*) {self.PENDING}").fetchone()[0]
 
     def founder(self, founder_id: int) -> Founder | None:
         r = self.store.db.execute("SELECT * FROM founders WHERE id=?", (founder_id,)).fetchone()
@@ -349,7 +351,7 @@ class Outreacher:
     async def prepare(self, f: Founder, send: bool) -> tuple[Result, dict | None]:
         track = track_for(f)
         # Re-fetch the page: the address must still be printed there, and the excerpt comes from the live page.
-        data = await self.scout.scrape(f.email_source, extract=False)
+        data = await self.scout.scrape(f.email_source, extract=False, need=f.email.lower())
         text = data.get("markdown") or ""
         if f.email.lower() not in page_emails(text):
             return Result(f, track, "skipped", "address no longer on its source page"), None
@@ -456,7 +458,7 @@ class Outreacher:
         for f in self.pending(limit if limit is not None else self.daily_limit):
             r = await self.process(f, send=True)
             if r.decision == "deferred":
-                self.log(f"outreach paused: {r.reason}; {len(self.pending(10000))} founders wait for free slots")
+                self.log(f"outreach paused: {r.reason}; {self.backlog()} founders wait for free slots")
                 break
             results.append(r)
             reset = limit_reset(r.reason) if r.decision == "error" else None

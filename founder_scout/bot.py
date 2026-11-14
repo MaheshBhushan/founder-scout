@@ -145,6 +145,9 @@ class FounderBot(discord.Client):
         # Persistent like auto_enabled: after each automatic run, draft emails for new founders
         # and queue them in morning send slots. Off unless someone turns it on.
         self.outreach_auto = self.store.get("outreach_auto", "false") == "true"
+        # Scouting costs Firecrawl credits; outreach sends at most daily_limit a day. Automatic runs
+        # pause while this many addresses already wait for an email. 0 scouts regardless.
+        self.backlog_limit = int(os.environ.get("SCOUT_BACKLOG_LIMIT", "200"))
         self.retry_task: asyncio.Task | None = None
         self._register()
 
@@ -227,7 +230,11 @@ class FounderBot(discord.Client):
             return
         try:
             channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
-            found = await self.scout_and_post(channel, None, None, None)
+            backlog = self.outreach.backlog() if self.outreach_auto else 0
+            if 0 < self.backlog_limit <= backlog:
+                log.info("scouting skipped: %s founders already wait for outreach (SCOUT_BACKLOG_LIMIT=%s)", backlog, self.backlog_limit)
+            else:
+                await self.scout_and_post(channel, None, None, None)
             # Work through every founder not yet emailed, so a restart never strands a run's founders.
             if self.outreach_auto and self.outreach.pending(1):
                 await self.outreach_and_post(channel)

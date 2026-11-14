@@ -199,7 +199,11 @@ fail closed rather than queueing an unverified address.
 
 ## Cost
 
-Each scraped page costs about 5 Firecrawl credits with JSON extraction, plus 1 credit per company-site check. A default run scrapes 8 pages, which uses about 40–60 credits. Set `MAX_PAGES_PER_RUN` and `AUTO_INTERVAL_MINUTES` to control spending.
+Each scraped page costs about 5 Firecrawl credits with JSON extraction, and each of the 8 searches about 2. A default run scrapes 8 pages, which uses about 40–60 credits. Set `MAX_PAGES_PER_RUN` and `AUTO_INTERVAL_MINUTES` to control spending.
+
+Company-site checks and the outreach re-fetch read the page directly at no cost. They fall back to Firecrawl (1 credit) only when the page is empty without JavaScript or the direct read does not show the address.
+
+While auto-outreach is on, automatic scouting pauses once `SCOUT_BACKLOG_LIMIT` (default 200) founders with an address wait for an email, because outreach sends at most `OUTREACH_DAILY_LIMIT` a day and more scouting would only grow the queue. Scouting resumes by itself when the queue drops below the limit. `/scout` always runs. Set the limit to 0 to scout regardless.
 
 ## Data protection
 

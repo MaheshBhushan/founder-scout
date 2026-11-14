@@ -9,18 +9,21 @@ cannot invent addresses.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import itertools
 import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from html.parser import HTMLParser
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
 FIRECRAWL = "https://api.firecrawl.dev/v2"
 EXA = "https://api.exa.ai"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}")
 JUNK_EMAIL = re.compile(
@@ -277,6 +280,47 @@ def page_emails(text: str) -> list[str]:
     return found
 
 
+class _VisibleText(HTMLParser):
+    SKIP = {"script", "style", "noscript", "template", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.out: list[str] = []
+        self.skipping = 0
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in self.SKIP:
+            self.skipping += 1
+        href = dict(attrs).get("href") or "" if tag == "a" else ""
+        # Every tag boundary becomes a space, so neighbouring elements never glue onto an address.
+        self.out.append(f" {unquote(href[7:].split('?')[0])} " if href.lower().startswith("mailto:") else " ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP and self.skipping:
+            self.skipping -= 1
+        self.out.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skipping:
+            self.out.append(data)
+
+
+def html_text(html: str) -> str:
+    """Visible text of an HTML page, with mailto: addresses written out."""
+    p = _VisibleText()
+    p.feed(html)
+    return re.sub(r"\s+", " ", "".join(p.out)).strip()
+
+
+async def is_public(url: str) -> bool:
+    """True when the URL is http(s) and its host resolves only to public addresses."""
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    infos = await asyncio.get_running_loop().getaddrinfo(u.hostname, None)
+    return all(ipaddress.ip_address(i[4][0]).is_global for i in infos)
+
+
 def classify_email(email: str, name: str) -> str:
     local = email.split("@")[0].lower()
     parts = [p for p in re.split(r"\W+", name.lower()) if len(p) > 1]
@@ -344,10 +388,38 @@ class Scout:
         r.raise_for_status()
         return [x["url"] for x in r.json().get("results", []) if x.get("url")]
 
-    async def scrape(self, url: str, extract: bool) -> dict:
+    async def fetch_text(self, url: str) -> str:
+        """Fetch a page directly, at no Firecrawl cost. Returns "" when the page needs a real browser."""
+        try:
+            for _ in range(5):
+                # Scraped pages supply these URLs, so never let one reach a private address.
+                if not await is_public(url):
+                    return ""
+                r = await self.http.get(url, headers={"user-agent": BROWSER_UA}, timeout=20)
+                if not r.is_redirect:
+                    break
+                url = urljoin(url, r.headers.get("location", ""))
+            else:
+                return ""
+        except (httpx.HTTPError, OSError, ValueError):
+            return ""
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+            return ""
+        return html_text(r.text)
+
+    async def scrape(self, url: str, extract: bool, need: str = "") -> dict:
+        """Page text as "markdown", plus extracted "json" when extract is set.
+
+        Plain-text reads try a direct fetch first and pay for Firecrawl only when the page
+        is empty without JavaScript or lacks the address in ``need``.
+        """
         formats: list = ["markdown"]
         if extract:
             formats.append({"type": "json", "prompt": PROFILE_PROMPT, "schema": PROFILE_SCHEMA})
+        else:
+            text = await self.fetch_text(url)
+            if len(text) >= 200 and (not need or need in page_emails(text)):
+                return {"markdown": text}
         data = await self._firecrawl("scrape", {"url": url, "formats": formats, "onlyMainContent": False, "timeout": 60000})
         return data.get("data", {})
 
