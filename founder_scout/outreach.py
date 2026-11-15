@@ -1,7 +1,9 @@
 """Outreach stage: draft an email per founder with Claude Code and queue it in the tailor tracker.
 
-Drafting runs `claude -p` with the outreach skill, so Claude reads the skill's
-SKILL.md and the tailor references itself and the bot never drifts from them.
+Drafting runs `claude -p` in one tool-less turn. The outreach skill's SKILL.md and
+the tailor references it names are read from disk on every draft and sent as the
+system prompt, so the bot never drifts from them and the identical prefix is cached.
+The skill files are long, so this single cached turn replaces a multi-turn tool loop.
 German companies get a working-student pitch; everyone else a remote-role pitch.
 When no project in the catalog fits the company, the email falls back to
 Mahesh's habit of learning a field from first principles.
@@ -15,6 +17,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,7 +34,9 @@ TRACKER_CONFIG = Path.home() / ".config" / "tailor-tracker"
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
-CLAUDE_TIMEOUT = 600
+CLAUDE_TIMEOUT = 300
+# The skill and the references it names, in the order the skill introduces them.
+SKILL_FILES = (SKILL_DIR / "SKILL.md", REFERENCES / "profile.md", REFERENCES / "projects.md", REFERENCES / "style.md")
 
 GERMAN_PLACES = [c.lower() for c in REGION_TIERS[0]] + ["germany", "deutschland", "münchen", "köln", "nürnberg", "frankfurt am main"]
 
@@ -122,9 +127,9 @@ DRAFT_SCHEMA = {
     "additionalProperties": False,
 }
 
-TASK = """Use the $outreach skill to draft one outreach email from Mahesh Koduri to a founder, department head, or employee at a startup. Read its SKILL.md and the tailor references it names (profile.md, projects.md, style.md) and follow them exactly.
+TASK = """Draft one outreach email from Mahesh Koduri to a founder, department head, or employee at a startup, following the outreach skill. The skill's SKILL.md and the tailor references it names (profile.md, projects.md, style.md) are included in full below this task; follow them exactly. Paths such as ../tailor/references/profile.md in the skill refer to those sections.
 
-You only draft. Do not run send.py, do not post to the tracker, do not fetch pages or browse: the founder's page text is supplied below and is the only evidence about the recipient. Return the JSON object described by the output schema.
+You only draft. Do not run send.py, do not post to the tracker, do not fetch pages or browse: the recipient details and page text arrive as the user message and are the only evidence about the recipient. Return the JSON object described by the output schema.
 
 The track (working student or remote) is given at the top of the recipient details. A REFERRAL ask below the track replaces the hiring ask for non-founders.
 
@@ -141,6 +146,15 @@ Hard rules:
 - purpose: one internal line for the dashboard, e.g. "Working-student enquiry; fits vektordb (vector search)".
 
 """
+
+
+def system_prompt() -> str:
+    """TASK plus the skill and its references, read fresh so edits to them apply on the next draft."""
+    parts = [TASK]
+    for path in SKILL_FILES:
+        label = path.name if path.parent == SKILL_DIR else f"../tailor/references/{path.name}"
+        parts.append(f"=== {label} ===\n{path.read_text()}")
+    return "\n\n".join(parts)
 
 
 def track_for(f: Founder) -> str:
@@ -321,22 +335,26 @@ class Outreacher:
             f"Company description (from scraping): {f.company_description}\nBio: {f.bio}\n\n"
             f"=== PAGE TEXT from {f.email_source} ===\n{page_text[:12000]}"
         )
-        prompt = f"{TASK}\n\n=== RECIPIENT ===\n{details}"
-        # Read-only tools, run from the skill dir so its relative ../tailor/references paths resolve.
-        proc = await asyncio.create_subprocess_exec(
-            CLAUDE_BIN, "-p", "--output-format", "json", "--json-schema", json.dumps(DRAFT_SCHEMA),
-            "--tools", "Read,Grep,Glob", "--add-dir", str(REFERENCES), "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT,
-            "--no-session-persistence",
-            cwd=str(SKILL_DIR),
-            # Drop any API key so claude uses the claude.ai login instead.
-            env={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"},
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(prompt.encode()), CLAUDE_TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError("claude timed out")
+        # One turn, no tools: the skill and references arrive as the system prompt, so the
+        # model never spends turns reading files and the identical prefix is cached across drafts.
+        with tempfile.TemporaryDirectory(prefix="founder-scout-draft-") as tmp:
+            system = Path(tmp) / "system.md"
+            system.write_text(system_prompt())
+            proc = await asyncio.create_subprocess_exec(
+                CLAUDE_BIN, "-p", "--output-format", "json", "--json-schema", json.dumps(DRAFT_SCHEMA),
+                "--system-prompt-file", str(system), "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
+                "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT, "--no-session-persistence",
+                # An empty directory, so no CLAUDE.md is discovered into the prompt.
+                cwd=tmp,
+                # Drop any API key so claude uses the claude.ai login instead.
+                env={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"},
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(details.encode()), CLAUDE_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError("claude timed out")
         res = json.loads(out) if out.strip() else {}
         # Newer CLIs print a list of events; the final one is the result.
         res = res[-1] if isinstance(res, list) and res else res
